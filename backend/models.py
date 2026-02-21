@@ -9,6 +9,7 @@ class SearchFilters(BaseModel):
     skills: list[str] = []
     experience_level: Optional[str] = None  # junior, mid, senior, lead, principal
     location: Optional[str] = None
+    description: Optional[str] = None  # free-text descriptors for AI matching
     page: int = 1
 
 

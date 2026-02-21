@@ -1,17 +1,11 @@
-"""
-LangGraph-powered agentic LinkedIn candidate discovery using REAL data.
-
-Uses DuckDuckGo HTML search (no API key, no rate limits) to find actual
-LinkedIn profiles, then uses the Ollama LLM agent to enrich and rank them.
-
-Agent graph:
-  plan_search → search_linkedin → enrich → evaluate → decide → [refine] or [finalize]
-"""
-
+import asyncio
 import hashlib
 import json
+import random
 import re
 import time
+import urllib.parse
+import urllib.request
 from typing import Literal
 from urllib.parse import unquote
 
@@ -25,35 +19,89 @@ from typing_extensions import TypedDict
 from models import Candidate, SearchFilters
 
 # ── Config ────────────────────────────────────────────────────────────
-OLLAMA_MODEL = "qwen2.5"
+OLLAMA_MODEL = "llama3.2"  # 2GB — ~2x faster than qwen2.5 while still capable
 MAX_REFINE_LOOPS = 1
 CACHE_TTL = 300
 
 _cache: dict[str, tuple[float, list[Candidate]]] = {}
 
+# ── Agent status (shared with SSE endpoint) ───────────────────────────
+agent_status: dict = {"steps": [], "done": True}
+
+
+def _emit(step_type: str, message: str, detail: str = ""):
+    """Push a status update for the SSE stream."""
+    agent_status["steps"].append({
+        "type": step_type,
+        "message": message,
+        "detail": detail,
+    })
+
 llm = ChatOllama(
     model=OLLAMA_MODEL,
     temperature=0.7,
-    num_predict=4096,
+    num_predict=3072,
 )
 
+# ── Header Rotation Pool ─────────────────────────────────────────────
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+]
+
+_ACCEPT_LANGUAGES = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "en-US,en;q=0.9,es;q=0.8",
+    "en-US,en;q=0.8",
+    "en,en-US;q=0.9",
+    "en-AU,en;q=0.9",
+    "en-CA,en;q=0.9",
+]
+
+_REFERERS = [
+    "https://www.google.com/",
+    "https://duckduckgo.com/",
+    "https://www.bing.com/",
+    "",  # no referer (direct visit)
+]
+
+
+def _random_headers() -> dict:
+    """Generate a unique set of browser-like headers for each request."""
+    return {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": random.choice(_REFERERS),
+        "DNT": random.choice(["1", "0"]),
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": random.choice(["none", "cross-site"]),
+    }
+
 DDG_URL = "https://html.duckduckgo.com/html/"
-DDG_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
 
 
 # ── Agent State ───────────────────────────────────────────────────────
 class AgentState(TypedDict):
     filters: dict
     search_query: str
-    raw_results: list[dict]          # Raw DuckDuckGo search results
-    parsed_candidates: list[dict]    # Parsed from search results
-    enriched_candidates: list[dict]  # LLM-enriched candidates
-    evaluated_candidates: list[dict] # Scored and ranked
+    raw_results: list[dict]
+    parsed_candidates: list[dict]
+    enriched_candidates: list[dict]
+    evaluated_candidates: list[dict]
     refinement_feedback: str
     refinement_count: int
     final_candidates: list[dict]
@@ -88,57 +136,187 @@ def _extract_json(text: str) -> list[dict] | dict:
 
 
 def _extract_ddg_url(href: str) -> str:
-    """Extract the actual URL from DuckDuckGo's redirect wrapper."""
-    # DDG wraps URLs like //duckduckgo.com/l/?uddg=<encoded_url>&rut=...
     if "uddg=" in href:
         match = re.search(r"uddg=([^&]+)", href)
         if match:
             return unquote(match.group(1))
     return href
 
-
-def _search_ddg(query: str) -> list[dict]:
-    """Search DuckDuckGo HTML endpoint and return parsed results."""
+def _search_brave(query: str) -> list[dict]:
+    """Search Brave Search — zero bot protection, fast, reliable."""
+    import subprocess
+    print(f"[Agent] 🔍 [Engine 0] Brave Search: {query}")
     try:
-        resp = httpx.post(
-            DDG_URL,
-            data={"q": query},
-            headers=DDG_HEADERS,
-            follow_redirects=True,
-            timeout=15.0,
-        )
-        resp.raise_for_status()
+        headers = _random_headers()
+        query_encoded = urllib.parse.quote(query)
+        url = f"https://search.brave.com/search?q={query_encoded}&source=web"
+        
+        cmd = [
+            "curl", "-s", "-m", "10",
+            "-A", headers["User-Agent"],
+            "-H", f"Accept-Language: {headers['Accept-Language']}",
+            url,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        html = result.stdout
+        
+        if not html:
+            print("[Engine 0] Empty response")
+            return []
+        
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        
+        results = []
+        # Brave uses <a> tags with LinkedIn hrefs throughout the page
+        seen = set()
+        for a in soup.find_all("a", href=re.compile(r"linkedin\.com/in/")):
+            href = a.get("href", "")
+            if href in seen:
+                continue
+            seen.add(href)
+            
+            # Find the nearest text content for title/snippet
+            title = a.get_text(strip=True) or ""
+            
+            # Walk up to find a snippet/description near this link
+            snippet = ""
+            parent = a.find_parent(attrs={"class": True})
+            if parent:
+                desc = parent.find(["p", "span", "div"], class_=lambda c: c and ("description" in str(c).lower() or "snippet" in str(c).lower()))
+                if desc:
+                    snippet = desc.get_text(strip=True)
+            
+            if not title:
+                # Use URL as title fallback
+                match = re.search(r"linkedin\.com/in/([^/\?]+)", href)
+                title = match.group(1).replace("-", " ").title() if match else href
+            
+            results.append({"title": title, "href": href, "snippet": snippet})
+        
+        print(f"[Agent] ✅ [Engine 0] Found {len(results)} LinkedIn results")
+        return results
     except Exception as e:
-        print(f"[DDG] Request failed: {e}")
+        print(f"[Engine 0 Error] {e}")
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    results = []
+def _search_ddg_html(query: str) -> list[dict]:
+    """Search DuckDuckGo HTML endpoint directly via native urllib POST."""
+    print(f"[Agent] 🔍 [Engine 1] DuckDuckGo HTML: {query}")
+    try:
+        url = "https://html.duckduckgo.com/html/"
+        data = urllib.parse.urlencode({"q": query}).encode("utf-8")
+        
+        headers = _random_headers()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers=headers,
+        )
+        
+        html = urllib.request.urlopen(req, timeout=10).read()
+        
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        
+        results = []
+        for el in soup.select(".result"):
+            link_el = el.select_one("a.result__url")
+            snip_el = el.select_one("a.result__snippet")
+            
+            if not link_el: continue
+            
+            title = link_el.get_text(strip=True)
+            raw_href = link_el.get("href", "")
+            href = _extract_ddg_url(raw_href)
+            snippet = snip_el.get_text(strip=True) if snip_el else ""
+            
+            if "linkedin.com/in" in href:
+                results.append({"title": title, "href": href, "snippet": snippet})
+                
+        print(f"[Agent] ✅ [Engine 1] Found {len(results)} LinkedIn results")
+        return results
+    except Exception as e:
+        print(f"[Engine 1 Error] {e}")
+        return []
 
-    for link in soup.select(".result__a"):
-        title = link.get_text(strip=True)
-        raw_href = link.get("href", "")
-        url = _extract_ddg_url(raw_href)
 
-        # Get the snippet
-        snippet_el = link.find_parent("div", class_="result")
-        snippet = ""
-        if snippet_el:
-            snippet_tag = snippet_el.select_one(".result__snippet")
-            if snippet_tag:
-                snippet = snippet_tag.get_text(strip=True)
+def _search_ddgs_package(query: str) -> list[dict]:
+    """Search DuckDuckGo using the duckduckgo_search Python package."""
+    print(f"[Agent] 🔍 [Engine 2] duckduckgo_search package: {query}")
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            raw = list(ddgs.text(query, max_results=15))
+        
+        results = []
+        for r in raw:
+            href = r.get("href", "")
+            if "linkedin.com/in" in href:
+                results.append({
+                    "title": r.get("title", ""),
+                    "href": href,
+                    "snippet": r.get("body", "")
+                })
+        
+        print(f"[Agent] ✅ [Engine 2] Found {len(results)} LinkedIn results")
+        return results
+    except Exception as e:
+        print(f"[Engine 2 Error] {e}")
+        return []
 
-        results.append({
-            "title": title,
-            "href": url,
-            "snippet": snippet,
-        })
 
-    return results
+def _search_google_pkg(query: str) -> list[dict]:
+    """Search Google using the googlesearch-python package."""
+    print(f"[Agent] 🔍 [Engine 3] googlesearch-python: {query}")
+    try:
+        from googlesearch import search as gsearch
+        raw = gsearch(query, num_results=15, advanced=True, sleep_interval=1)
+        
+        results = []
+        for r in raw:
+            if "linkedin.com/in" in r.url:
+                results.append({
+                    "title": r.title,
+                    "href": r.url,
+                    "snippet": r.description
+                })
+        
+        print(f"[Agent] ✅ [Engine 3] Found {len(results)} LinkedIn results")
+        return results
+    except Exception as e:
+        print(f"[Engine 3 Error] {e}")
+        return []
+
+
+def _search_multi(query: str) -> list[dict]:
+    """Try multiple search engines in order until one returns results."""
+    engines = [
+        _search_brave,        # Engine 0: Brave Search (no bot protection)
+        _search_ddg_html,     # Engine 1: DuckDuckGo HTML
+        _search_ddgs_package, # Engine 2: duckduckgo_search package
+        _search_google_pkg,   # Engine 3: googlesearch-python
+    ]
+    
+    for engine in engines:
+        results = engine(query)
+        if results:
+            # Deduplicate
+            unique = []
+            seen = set()
+            for r in results:
+                if r["href"] not in seen:
+                    seen.add(r["href"])
+                    unique.append(r)
+            return unique
+    
+    print("[Agent] ⚠️ All search engines failed to return results")
+    return []
 
 
 def _parse_linkedin_result(result: dict, search_skills: list[str]) -> dict | None:
-    """Parse a DDG search result into a candidate dict."""
     url = result.get("href", "")
     title = result.get("title", "")
     snippet = result.get("snippet", "")
@@ -146,29 +324,24 @@ def _parse_linkedin_result(result: dict, search_skills: list[str]) -> dict | Non
     if "linkedin.com/in/" not in url:
         return None
 
-    # Parse: "Jane Doe - Senior Engineer - Google | LinkedIn"
-    title_cleaned = re.sub(r"\s*\|\s*LinkedIn.*$", "", title).strip()
-    title_cleaned = re.sub(r"\s*-\s*LinkedIn.*$", "", title_cleaned).strip()
+    title_cleaned = re.sub(r"\s*[\|–-]\s*LinkedIn.*$", "", title).strip()
     parts = [p.strip() for p in title_cleaned.split(" - ", 2)]
     name = parts[0] if parts else "Unknown"
     headline = " - ".join(parts[1:]) if len(parts) > 1 else ""
 
-    if not name or name.lower() in ["linkedin", "sign in", "log in", ""]:
+    if not name or len(name) < 2 or name.lower() in ["linkedin", "sign in", "log in"]:
         return None
 
-    # Extract location from snippet
     location = ""
-    loc_patterns = [
-        r"(?:Location|Area|Region|Based in)[:\s]+([^·\n.]+)",
+    for pattern in [
+        r"(?:Location|Area|Based in)[:\s]+([^·\n.]+)",
         r"(?:located in|based in)\s+([^·\n.]+)",
-    ]
-    for pattern in loc_patterns:
+    ]:
         match = re.search(pattern, snippet, re.IGNORECASE)
         if match:
             location = match.group(1).strip()[:50]
             break
 
-    # Match skills
     full_text = f"{title} {snippet}".lower()
     matched = [s for s in search_skills if s.lower() in full_text]
 
@@ -183,80 +356,87 @@ def _parse_linkedin_result(result: dict, search_skills: list[str]) -> dict | Non
 
 
 # ══════════════════════════════════════════════════════════════════════
-# LangGraph Agent Nodes
+# LangGraph Agent Nodes (all 3 LLM calls preserved for full agency)
 # ══════════════════════════════════════════════════════════════════════
 
+# ── Node 1: Plan Search (LLM) ────────────────────────────────────────
 def plan_search(state: AgentState) -> dict:
-    """LLM plans the optimal search query."""
+    """LLM agent plans the optimal search query for DuckDuckGo."""
     filters = state["filters"]
     skills = ", ".join(filters.get("skills", []))
     level = filters.get("experience_level", "")
     location = filters.get("location", "")
+    description = filters.get("description", "")
     refinement = state.get("refinement_feedback", "")
 
     refinement_note = ""
     if refinement:
-        refinement_note = f"\n\nPrevious search had issues: {refinement}\nAdjust the query accordingly."
+        refinement_note = f"\nPrevious search had issues: {refinement}\nAdjust the query to be broader."
+
+    description_note = ""
+    if description:
+        description_note = f"\n7. Consider these extra descriptors: {description}"
 
     messages = [
         SystemMessage(content=(
-            "You are a recruitment search specialist. Create a DuckDuckGo search query "
-            "to find LinkedIn profiles (/in/ pages) matching the given criteria.\n\n"
+            "You are a recruitment search agent. Create a DuckDuckGo search query "
+            "to find LinkedIn profiles matching the criteria.\n\n"
             "Rules:\n"
-            "1. Include 'linkedin.com/in' in the query (NOT site: — DDG doesn't support it well)\n"
-            "2. Include the most important 1-2 skills\n"
+            "1. MUST start exactly with: site:linkedin.com/in\n"
+            "2. Include 1-2 most important skills\n"
             "3. Include experience level keywords if specified\n"
             "4. Include location if specified\n"
-            "5. Return ONLY the search query string — nothing else\n"
-            "6. Keep it concise — 5-8 words max after 'linkedin.com/in'\n\n"
-            "Example: linkedin.com/in Python senior software engineer San Francisco"
+            "5. Return ONLY the query string\n"
+            "6. Keep concise: 5-10 words total"
+            f"{description_note}\n\n"
+            "Example: site:linkedin.com/in Python senior engineer San Francisco"
         )),
         HumanMessage(content=(
-            f"Skills: {skills or 'any'}\n"
-            f"Level: {level or 'any'}\n"
-            f"Location: {location or 'any'}"
-            f"{refinement_note}"
+            f"Skills: {skills or 'any'}\nLevel: {level or 'any'}\n"
+            f"Location: {location or 'any'}\n"
+            f"Description: {description or 'none'}{refinement_note}"
         )),
     ]
 
+    _emit("thinking", "Planning search query...", "Analyzing filters to build optimal LinkedIn search")
+    print("[Agent] 🧠 Planning search query...")
     response = llm.invoke(messages)
-    query = response.content.strip().strip('"').strip("'").strip("`")
+    query = response.content.strip().strip('"\'`')
     if "\n" in query:
         query = query.split("\n")[0].strip()
 
-    print(f"[Agent] Planned query: {query}")
+    _emit("success", f"Search query ready", query)
+    print(f"[Agent] ✅ Query: {query}")
     return {"search_query": query}
 
 
+# ── Node 2: Search LinkedIn (DDG HTTP — no LLM) ──────────────────────
 def search_linkedin(state: AgentState) -> dict:
     """Fetch REAL LinkedIn profiles from DuckDuckGo."""
     query = state["search_query"]
-    filters = state["filters"]
-    skills = filters.get("skills", [])
+    skills = state["filters"].get("skills", [])
 
-    print(f"[Agent] Searching DuckDuckGo: {query}")
-    raw_results = _search_ddg(query)
-    print(f"[Agent] Got {len(raw_results)} raw results")
+    _emit("searching", "Searching for LinkedIn profiles...", f"Query: {query}")
+    print(f"[Agent] 🔍 Searching (multi-engine)...")
+    raw_results = _search_multi(query)
+    print(f"[Agent] ✅ {len(raw_results)} results found")
 
-    # Parse LinkedIn profiles
     candidates = []
-    seen_urls = set()
+    seen = set()
     for r in raw_results:
         parsed = _parse_linkedin_result(r, skills)
-        if parsed and parsed["profile_url"] not in seen_urls:
-            seen_urls.add(parsed["profile_url"])
+        if parsed and parsed["profile_url"] not in seen:
+            seen.add(parsed["profile_url"])
             candidates.append(parsed)
 
-    print(f"[Agent] Parsed {len(candidates)} LinkedIn profiles")
-
-    return {
-        "raw_results": raw_results,
-        "parsed_candidates": candidates,
-    }
+    _emit("success", f"Found {len(candidates)} LinkedIn profiles", f"{len(raw_results)} total results, {len(candidates)} profile pages")
+    print(f"[Agent] ✅ {len(candidates)} LinkedIn profiles parsed")
+    return {"raw_results": raw_results, "parsed_candidates": candidates}
 
 
+# ── Node 3: Enrich (LLM) ─────────────────────────────────────────────
 def enrich_candidates(state: AgentState) -> dict:
-    """LLM cleans and enriches the real candidate data."""
+    """LLM agent cleans and enriches the real candidate data."""
     candidates = state["parsed_candidates"]
     filters = state["filters"]
 
@@ -265,69 +445,77 @@ def enrich_candidates(state: AgentState) -> dict:
 
     messages = [
         SystemMessage(content=(
-            "You are a recruitment data analyst. Clean and enrich these REAL LinkedIn "
-            "search results. For each candidate, return a JSON object with:\n"
+            "You are a recruitment data analyst. Clean these REAL LinkedIn results.\n"
+            "For each candidate return a JSON object with:\n"
             '- "name": Cleaned name\n'
-            '- "headline": Cleaned role/title\n'
-            '- "location": Location if available, else "Unknown"\n'
-            '- "profile_url": Keep the original LinkedIn URL exactly as-is\n'
-            '- "snippet": Cleaned snippet\n'
-            '- "matched_skills": Skills from the search that appear in their profile\n'
+            '- "headline": Cleaned title/role\n'
+            '- "location": Location or "Unknown"\n'
+            '- "profile_url": KEEP the original LinkedIn URL exactly\n'
+            '- "snippet": Cleaned summary\n'
+            '- "matched_skills": Skills from the search matching their profile\n'
             '- "experience_level": Infer from title (junior/mid/senior/lead/principal)\n\n'
             "Return ONLY a JSON array. Do NOT invent information."
         )),
         HumanMessage(content=(
             f"Filters: skills={filters.get('skills')}, "
             f"level={filters.get('experience_level')}, "
-            f"location={filters.get('location')}\n\n"
+            f"location={filters.get('location')}, "
+            f"description={filters.get('description', 'none')}\n\n"
             f"Candidates:\n{json.dumps(candidates, indent=2)}"
         )),
     ]
 
+    _emit("thinking", "Enriching candidate profiles...", "Cleaning data and extracting experience levels")
+    print("[Agent] 🧠 Enriching candidate data...")
     response = llm.invoke(messages)
     enriched = _extract_json(response.content)
     if isinstance(enriched, dict):
         enriched = [enriched]
 
-    # Preserve original URLs in case LLM strips them
     if isinstance(enriched, list):
         for i, e in enumerate(enriched):
             if i < len(candidates) and not e.get("profile_url"):
                 e["profile_url"] = candidates[i].get("profile_url", "")
 
+    count = len(enriched) if isinstance(enriched, list) else 0
+    _emit("success", f"Enriched {count} candidate profiles", "Data cleaned and structured")
+    print(f"[Agent] ✅ {count} candidates enriched")
     return {"enriched_candidates": enriched if isinstance(enriched, list) else candidates}
 
 
+# ── Node 4: Evaluate (LLM) ───────────────────────────────────────────
 def evaluate_candidates(state: AgentState) -> dict:
-    """LLM scores and ranks candidates by relevance."""
+    """LLM agent scores and ranks candidates by relevance."""
     candidates = state["enriched_candidates"]
     filters = state["filters"]
 
     if not candidates:
         return {
             "evaluated_candidates": [],
-            "refinement_feedback": "No LinkedIn profiles found. Try broader skills.",
+            "refinement_feedback": "No profiles found. Broaden search.",
         }
 
     messages = [
         SystemMessage(content=(
-            "You are a senior tech recruiter evaluating REAL LinkedIn candidates.\n"
-            "Score each candidate 1-10 based on: skill match, experience level match, "
-            "location match, and profile quality.\n\n"
+            "You are a senior tech recruiter. Score each candidate 1-10 based on:\n"
+            "skill match, experience level match, location match, profile quality,"
+            " and how well they match the user's description.\n\n"
             "Return ONLY a JSON array with:\n"
             '- "index": Position (0-based)\n'
             '- "score": 1-10\n'
             '- "reason": One sentence\n'
-            "Return ONLY the JSON array."
         )),
         HumanMessage(content=(
             f"Required: skills={filters.get('skills')}, "
             f"level={filters.get('experience_level', 'any')}, "
-            f"location={filters.get('location', 'any')}\n\n"
+            f"location={filters.get('location', 'any')}, "
+            f"description={filters.get('description', 'none')}\n\n"
             f"Candidates:\n{json.dumps(candidates, indent=2)}"
         )),
     ]
 
+    _emit("thinking", "Evaluating and ranking candidates...", "Scoring each candidate on skill match, experience, and relevance")
+    print("[Agent] 🧠 Evaluating and ranking candidates...")
     response = llm.invoke(messages)
     evaluations = _extract_json(response.content)
     if not isinstance(evaluations, list):
@@ -349,19 +537,23 @@ def evaluate_candidates(state: AgentState) -> dict:
 
     feedback = ""
     if len(evaluated) < 3:
-        feedback = "Too few results. Broaden the query — fewer skills, drop location."
+        feedback = "Too few results. Broaden the query."
 
-    return {
-        "evaluated_candidates": evaluated,
-        "refinement_feedback": feedback,
-    }
+    _emit("success", f"Ranked {len(evaluated)} candidates by relevance", "Candidates sorted by match score")
+    print(f"[Agent] ✅ {len(evaluated)} candidates scored and ranked")
+    return {"evaluated_candidates": evaluated, "refinement_feedback": feedback}
 
 
+# ── Node 5: Decide ───────────────────────────────────────────────────
 def decide(state: AgentState) -> Literal["refine", "finish"]:
     feedback = state.get("refinement_feedback", "")
     count = state.get("refinement_count", 0)
     if feedback and count < MAX_REFINE_LOOPS:
+        _emit("refining", "Refining search...", "Results were insufficient, trying a broader query")
+        print("[Agent] 🔄 Refining — results were insufficient")
         return "refine"
+    _emit("success", "Results look good — finalizing", "")
+    print("[Agent] ✅ Results look good — finalizing")
     return "finish"
 
 
@@ -374,15 +566,15 @@ def finalize(state: AgentState) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Build the LangGraph
+# Build the LangGraph — fully agentic with 3 LLM-powered nodes
 # ══════════════════════════════════════════════════════════════════════
 def _build_graph() -> StateGraph:
     graph = StateGraph(AgentState)
 
-    graph.add_node("plan_search", plan_search)
-    graph.add_node("search_linkedin", search_linkedin)
-    graph.add_node("enrich", enrich_candidates)
-    graph.add_node("evaluate", evaluate_candidates)
+    graph.add_node("plan_search", plan_search)         # LLM plans query
+    graph.add_node("search_linkedin", search_linkedin) # DDG HTTP fetch
+    graph.add_node("enrich", enrich_candidates)        # LLM enriches data
+    graph.add_node("evaluate", evaluate_candidates)    # LLM scores & ranks
     graph.add_node("refine", prepare_refinement)
     graph.add_node("finalize", finalize)
 
@@ -438,8 +630,8 @@ def _to_candidate(data: dict, search_skills: list[str]) -> Candidate:
 async def search_linkedin_profiles(
     filters: SearchFilters,
 ) -> tuple[list[Candidate], bool]:
-    """Run the LangGraph agent to discover REAL LinkedIn candidates."""
-    cache_key = f"{sorted(filters.skills)}:{filters.experience_level}:{filters.location}:{filters.page}"
+    """Run the fully agentic LangGraph pipeline."""
+    cache_key = f"{sorted(filters.skills)}:{filters.experience_level}:{filters.location}:{filters.description}:{filters.page}"
     key = hashlib.md5(cache_key.encode()).hexdigest()
 
     if key in _cache:
@@ -452,6 +644,7 @@ async def search_linkedin_profiles(
             "skills": filters.skills,
             "experience_level": filters.experience_level or "",
             "location": filters.location or "",
+            "description": filters.description or "",
         },
         "search_query": "",
         "raw_results": [],
@@ -464,8 +657,15 @@ async def search_linkedin_profiles(
     }
 
     try:
-        print("[Agent] Starting LangGraph candidate search...")
-        result = agent_graph.invoke(initial_state)
+        # Reset agent status for SSE streaming
+        agent_status["steps"] = []
+        agent_status["done"] = False
+        _emit("start", "Starting AI agent search...", "Initializing LangGraph pipeline")
+
+        print("\n[Agent] 🚀 Starting agentic candidate search...")
+        # Run synchronous LangGraph execution in a separate thread to prevent blocking
+        # the FastAPI event loop so the SSE endpoint can stream agent thoughts in real-time.
+        result = await asyncio.to_thread(agent_graph.invoke, initial_state)
         raw_list = result.get("final_candidates", [])
 
         candidates = []
@@ -475,15 +675,18 @@ async def search_linkedin_profiles(
             except Exception:
                 continue
 
-        print(f"[Agent] Returning {len(candidates)} real candidates")
+        print(f"[Agent] 🎯 Done — {len(candidates)} real candidates returned\n")
 
         if candidates:
             _cache[key] = (time.time(), candidates)
 
+        agent_status["done"] = True
         return candidates, False
 
     except Exception as e:
-        print(f"[LangGraph Agent Error] {e}")
+        _emit("error", f"Agent error: {str(e)}", "")
+        agent_status["done"] = True
+        print(f"[Agent Error] {e}")
         import traceback
         traceback.print_exc()
         return [], False

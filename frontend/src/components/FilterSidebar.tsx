@@ -23,16 +23,50 @@ const EXPERIENCE_LEVELS = [
 const LOCATIONS = [
     { value: "", label: "Any Location" },
     { value: "Remote", label: "🌍 Remote" },
+    // United States
     { value: "San Francisco", label: "🇺🇸 San Francisco" },
     { value: "New York", label: "🇺🇸 New York" },
     { value: "Seattle", label: "🇺🇸 Seattle" },
     { value: "Austin", label: "🇺🇸 Austin" },
+    { value: "Los Angeles", label: "🇺🇸 Los Angeles" },
+    { value: "Chicago", label: "🇺🇸 Chicago" },
+    { value: "Boston", label: "🇺🇸 Boston" },
+    { value: "Denver", label: "🇺🇸 Denver" },
+    { value: "Miami", label: "🇺🇸 Miami" },
+    { value: "Washington DC", label: "🇺🇸 Washington DC" },
+    { value: "Atlanta", label: "🇺🇸 Atlanta" },
+    { value: "Dallas", label: "🇺🇸 Dallas" },
+    { value: "Portland", label: "🇺🇸 Portland" },
+    { value: "San Diego", label: "🇺🇸 San Diego" },
+    // Europe
     { value: "London", label: "🇬🇧 London" },
     { value: "Berlin", label: "🇩🇪 Berlin" },
+    { value: "Munich", label: "🇩🇪 Munich" },
+    { value: "Amsterdam", label: "🇳🇱 Amsterdam" },
+    { value: "Paris", label: "🇫🇷 Paris" },
+    { value: "Dublin", label: "🇮🇪 Dublin" },
+    { value: "Stockholm", label: "🇸🇪 Stockholm" },
+    { value: "Barcelona", label: "🇪🇸 Barcelona" },
+    { value: "Zurich", label: "🇨🇭 Zurich" },
+    { value: "Warsaw", label: "🇵🇱 Warsaw" },
+    // Canada
     { value: "Toronto", label: "🇨🇦 Toronto" },
+    { value: "Vancouver", label: "🇨🇦 Vancouver" },
+    { value: "Montreal", label: "🇨🇦 Montreal" },
+    // Asia-Pacific
     { value: "Singapore", label: "🇸🇬 Singapore" },
     { value: "Sydney", label: "🇦🇺 Sydney" },
+    { value: "Melbourne", label: "🇦🇺 Melbourne" },
     { value: "Bangalore", label: "🇮🇳 Bangalore" },
+    { value: "Hyderabad", label: "🇮🇳 Hyderabad" },
+    { value: "Mumbai", label: "🇮🇳 Mumbai" },
+    { value: "Tokyo", label: "🇯🇵 Tokyo" },
+    { value: "Seoul", label: "🇰🇷 Seoul" },
+    { value: "Tel Aviv", label: "🇮🇱 Tel Aviv" },
+    // Latin America
+    { value: "São Paulo", label: "🇧🇷 São Paulo" },
+    { value: "Mexico City", label: "🇲🇽 Mexico City" },
+    { value: "Buenos Aires", label: "🇦🇷 Buenos Aires" },
 ];
 
 interface Props {
@@ -45,6 +79,7 @@ export default function FilterSidebar({ onSearch, isLoading }: Props) {
     const [customSkill, setCustomSkill] = useState("");
     const [experienceLevel, setExperienceLevel] = useState("");
     const [location, setLocation] = useState("");
+    const [description, setDescription] = useState("");
     const [showAllSkills, setShowAllSkills] = useState(false);
 
     const displayedSkills = showAllSkills ? POPULAR_SKILLS : POPULAR_SKILLS.slice(0, 15);
@@ -69,6 +104,7 @@ export default function FilterSidebar({ onSearch, isLoading }: Props) {
             skills: selectedSkills,
             experience_level: experienceLevel,
             location,
+            description,
         });
     }
 
@@ -76,9 +112,10 @@ export default function FilterSidebar({ onSearch, isLoading }: Props) {
         setSelectedSkills([]);
         setExperienceLevel("");
         setLocation("");
+        setDescription("");
     }
 
-    const hasActiveFilters = selectedSkills.length > 0 || experienceLevel || location;
+    const hasActiveFilters = selectedSkills.length > 0 || experienceLevel || location || description.trim();
 
     return (
         <aside className="filter-sidebar">
@@ -183,6 +220,29 @@ export default function FilterSidebar({ onSearch, isLoading }: Props) {
                         </option>
                     ))}
                 </select>
+            </div>
+
+            {/* Candidate Description */}
+            <div className="filter-section">
+                <h3>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: 6, verticalAlign: "middle" }}>
+                        <path d="M12 20h9" />
+                        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                    </svg>
+                    Candidate Description
+                </h3>
+                <p className="filter-hint">Describe your ideal candidate — the AI will match profiles against this.</p>
+                <textarea
+                    className="description-input"
+                    placeholder="e.g. Looking for someone with startup experience, strong communication skills, experience building APIs at scale, passionate about open source..."
+                    value={description}
+                    onChange={(e) => setDescription(e.target.value)}
+                    rows={4}
+                    maxLength={500}
+                />
+                {description.trim() && (
+                    <span className="char-count">{description.length}/500</span>
+                )}
             </div>
 
             {/* Search Button */}

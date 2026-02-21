@@ -15,6 +15,7 @@ export interface SearchFilters {
     skills: string[];
     experience_level: string;
     location: string;
+    description: string;
 }
 
 export interface SearchResponse {
