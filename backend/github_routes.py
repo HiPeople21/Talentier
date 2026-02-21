@@ -49,28 +49,31 @@ async def search_repositories(
     )
 
 
-@router.post("/search/repos/batch")
+@router.get("/search/repos/batch", response_model=RepositorySearchResponse)
 async def search_multiple_repositories(
     tags: List[str] = Query(..., description="List of tags to search"),
     language: Optional[str] = Query(None, description="Programming language filter"),
     min_stars: int = Query(0, ge=0, description="Minimum star count"),
+    max_results: int = Query(30, ge=1, le=100, description="Maximum results to return"),
 ):
     """
-    Search multiple tags at once.
+    Search for repositories with all specified tags.
     
     Args:
-        tags: List of tags to search for
+        tags: List of tags to search for (repos must have ALL tags)
         language: Optional programming language filter
         min_stars: Minimum star count filter
+        max_results: Number of results to return (max 100)
     
     Returns:
-        Dictionary mapping each tag to its search results
+        Repositories that have all specified tags
     """
     github_tools = get_github_tools()
     return github_tools.search_multiple_repos(
         tags=tags,
         language=language,
-        min_stars=min_stars
+        min_stars=min_stars,
+        max_results=max_results
     )
 
 

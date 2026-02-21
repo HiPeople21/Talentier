@@ -140,31 +140,71 @@ class RepositorySearcher(GitHubClient):
         tags: List[str],
         language: Optional[str] = None,
         min_stars: int = 0,
-        max_results_per_tag: int = 20
-    ) -> Dict[str, RepositorySearchResponse]:
+        max_results: int = 30
+    ) -> RepositorySearchResponse:
         """
-        Search multiple tags and return results.
+        Search for repositories that have all specified tags.
         
         Args:
-            tags: List of tags to search
+            tags: List of tags to search (repos must have ALL tags)
             language: Programming language filter
             min_stars: Minimum star count
-            max_results_per_tag: Max results per tag
+            max_results: Maximum results to return
             
         Returns:
-            Dictionary mapping tags to results
+            RepositorySearchResponse with repos containing all tags
         """
-        results = {}
-        for tag in tags:
-            results[tag] = self.search_by_tag(
-                tag,
+        try:
+            repos = []
+            # Build query with all tags - repos must have ALL of them
+            query = " ".join([f"topic:{tag}" for tag in tags])
+            
+            if language:
+                query += f" language:{language}"
+            
+            if min_stars > 0:
+                query += f" stars:>={min_stars}"
+            
+            page = 1
+            per_page = min(100, max_results)
+            
+            while len(repos) < max_results:
+                params = {
+                    "q": query,
+                    "sort": "stars",
+                    "order": "desc",
+                    "per_page": per_page,
+                    "page": page
+                }
+                
+                data = self._get(f"{BASE_URL}/search/repositories", params=params)
+                
+                if not data or "items" not in data or not data["items"]:
+                    break
+                
+                repos.extend(data["items"])
+                page += 1
+                time.sleep(0.3)
+            
+            return RepositorySearchResponse(
+                tag=", ".join(tags),
                 language=language,
                 min_stars=min_stars,
-                max_results=max_results_per_tag
+                repositories=repos[:max_results],
+                total_found=len(repos[:max_results]),
+                success=True
             )
-            time.sleep(0.5)
         
-        return results
+        except Exception as e:
+            return RepositorySearchResponse(
+                tag=", ".join(tags),
+                language=language,
+                min_stars=min_stars,
+                repositories=[],
+                total_found=0,
+                success=False,
+                error=str(e)
+            )
 
 
 # ============================================================================
@@ -413,13 +453,15 @@ class GitHubTools:
         self,
         tags: List[str],
         language: Optional[str] = None,
-        min_stars: int = 0
-    ) -> Dict[str, RepositorySearchResponse]:
-        """Search multiple tags."""
+        min_stars: int = 0,
+        max_results: int = 30
+    ) -> RepositorySearchResponse:
+        """Search for repos with all specified tags."""
         return self.searcher.search_by_multiple_tags(
             tags=tags,
             language=language,
-            min_stars=min_stars
+            min_stars=min_stars,
+            max_results=max_results
         )
     
     def get_contributors(
