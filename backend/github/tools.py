@@ -439,6 +439,8 @@ class GitHubTools:
         tag: str,
         language: Optional[str] = None,
         min_stars: int = 0,
+        sort: str = "stars",
+        order: str = "desc",
         max_results: int = 30
     ) -> RepositorySearchResponse:
         """Search repositories by tag."""
@@ -446,6 +448,8 @@ class GitHubTools:
             tag=tag,
             language=language,
             min_stars=min_stars,
+            sort=sort,
+            order=order,
             max_results=max_results
         )
     
