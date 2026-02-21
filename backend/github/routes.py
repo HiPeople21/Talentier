@@ -79,6 +79,36 @@ async def search_multiple_repositories(
     )
 
 
+@router.get("/search/repos/impact", response_model=RepositorySearchResponse)
+async def search_repositories_by_impact(
+    tags: List[str] = Query(..., description="Topic tags to search"),
+    language: Optional[str] = Query(None, description="Programming language filter"),
+    min_stars: int = Query(0, ge=0, description="Minimum star count"),
+    max_results: int = Query(30, ge=1, le=100, description="Maximum results to return"),
+    match_all_tags: bool = Query(
+        True, description="If true, repo must match all tags; else any tag match"
+    ),
+    include_clones: bool = Query(
+        False,
+        description="Attempt to include 14-day clone traffic when API permissions allow",
+    ),
+):
+    """
+    Search repositories by tags and rank by impact.
+
+    Impact score includes stars, forks, watchers, open issues, and optional clone traffic.
+    """
+    github_tools = get_github_tools()
+    return github_tools.search_repos_by_impact(
+        tags=tags,
+        language=language,
+        min_stars=min_stars,
+        max_results=max_results,
+        match_all_tags=match_all_tags,
+        include_clones=include_clones,
+    )
+
+
 # ============================================================================
 # Repository Contributors Routes
 # ============================================================================
@@ -189,6 +219,7 @@ async def github_api_health():
         "endpoints": [
             "GET /api/github/search/repos",
             "GET /api/github/search/repos/batch",
+            "GET /api/github/search/repos/impact",
             "GET /api/github/repos/{owner}/{repo}/contributors",
             "GET /api/github/repos/{owner}/{repo}/contributors/{contributor}/commits",
             "GET /api/github/repos/{owner}/{repo}/contributors/commits/all",

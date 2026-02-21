@@ -7,6 +7,7 @@ Ready for FastAPI integration.
 from collections import defaultdict
 from dotenv import load_dotenv
 from typing import List, Dict, Optional
+import math
 import os
 import requests
 import time
@@ -204,6 +205,158 @@ class RepositorySearcher(GitHubClient):
                 total_found=0,
                 success=False,
                 error=str(e)
+            )
+
+    def _get_repo_clones_14d(self, owner: str, repo: str) -> Dict[str, int]:
+        """
+        Try to fetch 14-day clone traffic for a repo.
+
+        Note: GitHub traffic endpoints usually require push/admin access.
+        If unavailable, returns zeros.
+        """
+        try:
+            url = f"{BASE_URL}/repos/{owner}/{repo}/traffic/clones"
+            data = self._get(url)
+            if not data:
+                return {"count": 0, "uniques": 0}
+            return {
+                "count": int(data.get("count", 0) or 0),
+                "uniques": int(data.get("uniques", 0) or 0),
+            }
+        except Exception:
+            return {"count": 0, "uniques": 0}
+
+    def _impact_score(self, repo: Dict, clones: Optional[Dict[str, int]] = None) -> Dict:
+        """Compute a single impact score from common popularity and activity metrics."""
+        clones = clones or {"count": 0, "uniques": 0}
+
+        stars = int(repo.get("stargazers_count", 0) or 0)
+        forks = int(repo.get("forks_count", 0) or 0)
+        watchers = int(repo.get("watchers_count", 0) or 0)
+        open_issues = int(repo.get("open_issues_count", 0) or 0)
+        clone_count = int(clones.get("count", 0) or 0)
+        unique_clones = int(clones.get("uniques", 0) or 0)
+
+        score = (
+            6.0 * math.log1p(stars)
+            + 3.5 * math.log1p(forks)
+            + 1.5 * math.log1p(watchers)
+            + 1.0 * math.log1p(open_issues)
+            + 2.5 * math.log1p(clone_count)
+            + 2.0 * math.log1p(unique_clones)
+        )
+
+        return {
+            "impact_score": round(score, 4),
+            "impact_metrics": {
+                "stars": stars,
+                "forks": forks,
+                "watchers": watchers,
+                "open_issues": open_issues,
+                "clones_14d": clone_count,
+                "unique_clones_14d": unique_clones,
+            },
+        }
+
+    def search_by_impact(
+        self,
+        tags: List[str],
+        language: Optional[str] = None,
+        min_stars: int = 0,
+        max_results: int = 30,
+        match_all_tags: bool = True,
+        include_clones: bool = False,
+    ) -> RepositorySearchResponse:
+        """
+        Search repos by tags/topics and sort by weighted impact score.
+
+        Impact includes stars/forks/watchers/issues and optional clone traffic.
+        """
+        try:
+            clean_tags = [t.strip() for t in tags if t and t.strip()]
+            if not clean_tags:
+                return RepositorySearchResponse(
+                    tag="",
+                    language=language,
+                    min_stars=min_stars,
+                    repositories=[],
+                    total_found=0,
+                    success=False,
+                    error="At least one tag is required."
+                )
+
+            if match_all_tags:
+                query = " ".join([f"topic:{tag}" for tag in clean_tags])
+            else:
+                query = " OR ".join([f"topic:{tag}" for tag in clean_tags])
+                query = f"({query})"
+
+            if language:
+                query += f" language:{language}"
+            if min_stars > 0:
+                query += f" stars:>={min_stars}"
+
+            repos = []
+            page = 1
+            # fetch a larger pool then rerank by impact
+            fetch_target = min(200, max_results * 4)
+            per_page = min(100, fetch_target)
+
+            while len(repos) < fetch_target:
+                params = {
+                    "q": query,
+                    "sort": "stars",
+                    "order": "desc",
+                    "per_page": per_page,
+                    "page": page,
+                }
+                data = self._get(f"{BASE_URL}/search/repositories", params=params)
+                items = (data or {}).get("items", [])
+                if not items:
+                    break
+                repos.extend(items)
+                page += 1
+                time.sleep(0.2)
+
+            scored = []
+            seen = set()
+            for repo in repos:
+                full_name = repo.get("full_name", "")
+                if not full_name or full_name in seen:
+                    continue
+                seen.add(full_name)
+
+                owner = (repo.get("owner") or {}).get("login", "")
+                name = repo.get("name", "")
+                clones = {"count": 0, "uniques": 0}
+                if include_clones and owner and name:
+                    clones = self._get_repo_clones_14d(owner, name)
+
+                score_data = self._impact_score(repo, clones=clones)
+                enriched = dict(repo)
+                enriched.update(score_data)
+                scored.append(enriched)
+
+            scored.sort(key=lambda r: r.get("impact_score", 0), reverse=True)
+            final_repos = scored[:max_results]
+
+            return RepositorySearchResponse(
+                tag=", ".join(clean_tags),
+                language=language,
+                min_stars=min_stars,
+                repositories=final_repos,
+                total_found=len(final_repos),
+                success=True,
+            )
+        except Exception as e:
+            return RepositorySearchResponse(
+                tag=", ".join(tags),
+                language=language,
+                min_stars=min_stars,
+                repositories=[],
+                total_found=0,
+                success=False,
+                error=str(e),
             )
 
 
@@ -495,6 +648,25 @@ class GitHubTools:
     ) -> Dict[str, ContributorCommitsResponse]:
         """Get commits for all top contributors."""
         return self.analyzer.get_all_contributors_commits(owner, repo, max_contributors)
+
+    def search_repos_by_impact(
+        self,
+        tags: List[str],
+        language: Optional[str] = None,
+        min_stars: int = 0,
+        max_results: int = 30,
+        match_all_tags: bool = True,
+        include_clones: bool = False,
+    ) -> RepositorySearchResponse:
+        """Search repositories by topic and rank by impact."""
+        return self.searcher.search_by_impact(
+            tags=tags,
+            language=language,
+            min_stars=min_stars,
+            max_results=max_results,
+            match_all_tags=match_all_tags,
+            include_clones=include_clones,
+        )
 
 
 # Singleton instance
