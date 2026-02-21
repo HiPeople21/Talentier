@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from models import SearchResponse
 from scraper import SearchFilters, search_linkedin_profiles
-from github_routes import router as github_router
+from github import router as github_router
 
 app = FastAPI(
     title="Recruiter Candidate Finder",

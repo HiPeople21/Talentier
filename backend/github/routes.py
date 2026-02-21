@@ -3,7 +3,7 @@
 from typing import Optional, List
 from fastapi import APIRouter, Query
 
-from github_tools import get_github_tools
+from .tools import get_github_tools
 from models import (
     RepositorySearchResponse,
     ContributorsResponse,
@@ -186,7 +186,7 @@ async def github_api_health():
         "service": "github_tools",
         "endpoints": [
             "GET /api/github/search/repos",
-            "POST /api/github/search/repos/batch",
+            "GET /api/github/search/repos/batch",
             "GET /api/github/repos/{owner}/{repo}/contributors",
             "GET /api/github/repos/{owner}/{repo}/contributors/{contributor}/commits",
             "GET /api/github/repos/{owner}/{repo}/contributors/commits/all",
