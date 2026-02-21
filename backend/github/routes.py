@@ -45,6 +45,8 @@ async def search_repositories(
         tag=tag,
         language=language,
         min_stars=min_stars,
+        sort=sort,
+        order=order,
         max_results=max_results
     )
 
