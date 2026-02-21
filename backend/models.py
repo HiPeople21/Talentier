@@ -93,6 +93,10 @@ class CommitInfo(BaseModel):
     author: str
     date: str
     url: str
+    diff: Optional[str] = None
+    files_changed: int = 0
+    additions: int = 0
+    deletions: int = 0
 
 
 class ContributorCommitsResponse(BaseModel):

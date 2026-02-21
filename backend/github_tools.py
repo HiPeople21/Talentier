@@ -174,6 +174,24 @@ class RepositorySearcher(GitHubClient):
 class CommitAnalyzer(GitHubClient):
     """Analyze commits and contributors in GitHub repositories."""
     
+    def _get_commit_diff(self, owner: str, repo: str, sha: str) -> Optional[Dict]:
+        """
+        Get detailed commit information including diff.
+        
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            sha: Commit SHA
+            
+        Returns:
+            Commit details with patch (diff)
+        """
+        try:
+            url = f"{BASE_URL}/repos/{owner}/{repo}/commits/{sha}"
+            return self._get(url)
+        except Exception as e:
+            return None
+    
     def get_contributors(
         self,
         owner: str,
@@ -274,14 +292,40 @@ class CommitAnalyzer(GitHubClient):
             
             commit_list = []
             for commit in commits[:max_results]:
+                # Fetch full commit details including diff
+                commit_sha = commit.get("sha", "")
+                full_commit = self._get_commit_diff(owner, repo, commit_sha)
+                
+                # Build diff from all file patches
+                diff_str = ""
+                files_changed = 0
+                additions = 0
+                deletions = 0
+                
+                if full_commit and "files" in full_commit:
+                    files = full_commit.get("files", [])
+                    files_changed = len(files)
+                    
+                    for file in files:
+                        # Collect patch from each file
+                        if "patch" in file:
+                            diff_str += file.get("patch", "") + "\n"
+                        additions += file.get("additions", 0)
+                        deletions += file.get("deletions", 0)
+                
                 commit_info = CommitInfo(
-                    sha=commit.get("sha", "")[:7],
+                    sha=commit.get("sha", ""),
                     message=commit.get("commit", {}).get("message", "").split('\n')[0],
                     author=commit.get("commit", {}).get("author", {}).get("name", ""),
                     date=commit.get("commit", {}).get("author", {}).get("date", ""),
-                    url=commit.get("html_url", "")
+                    url=commit.get("html_url", ""),
+                    diff=diff_str.strip(),
+                    files_changed=files_changed,
+                    additions=additions,
+                    deletions=deletions
                 )
                 commit_list.append(commit_info)
+                time.sleep(0.1)  # Rate limit for diff fetches
             
             return ContributorCommitsResponse(
                 owner=owner,
