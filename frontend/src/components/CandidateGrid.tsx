@@ -87,6 +87,7 @@ export default function CandidateGrid({
                     <div
                         key={candidate.id}
                         className="candidate-row"
+                        style={{ animationDelay: `${index * 50}ms` }}
                         onClick={() => onCandidateClick(candidate)}
                     >
                         <div className="row-rank">{index + 1}</div>
