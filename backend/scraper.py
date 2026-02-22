@@ -15,6 +15,7 @@ import re
 import time
 from urllib.parse import urlparse
 
+import anthropic
 import requests
 from ddgs import DDGS
 
@@ -24,39 +25,41 @@ from models import Candidate, SearchFilters
 # ── Config ────────────────────────────────────────────────────────────
 CACHE_TTL = 300
 DDG_TIMEOUT = 20           # Per-request HTTP timeout inside DDGS session
-GITHUB_TIMEOUT = 180      # Includes Ollama commit analysis time
-OLLAMA_TIMEOUT = 30
+GITHUB_TIMEOUT = 180      # Includes Claude commit analysis time
+CLAUDE_TIMEOUT = 30        # Max seconds to wait for a Claude API response
 MAX_DDG_RESULTS = 50
 MAX_GITHUB_REPOS = 2
 MAX_GITHUB_FETCH_CONTRIBS = 30  # How many contributors to pull from GitHub per repo
-MAX_GITHUB_ANALYZE = 8          # How many of those to run through Ollama commit review
+MAX_GITHUB_ANALYZE = 8          # How many of those to run through Claude commit review
 MAX_COMMITS_PER_CONTRIB = 2
-OLLAMA_MODEL = "llama3"
-OLLAMA_URL = "http://localhost:11434/api/generate"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 _cache: dict[str, tuple[float, list[Candidate]]] = {}
 _search_status: dict[str, str] = {}   # thread-safe flag channel
 
+# Single shared client — thread-safe, reuses connection pool
+_claude_client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
-# ── Ollama helpers ────────────────────────────────────────────────────
-def _ollama(prompt: str, timeout: int = OLLAMA_TIMEOUT) -> str:
-    resp = requests.post(
-        OLLAMA_URL,
-        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-        timeout=timeout,
+
+# ── Claude helpers ─────────────────────────────────────────────────────
+def _claude(prompt: str) -> str:
+    """Call Claude and return the text response."""
+    msg = _claude_client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
     )
-    resp.raise_for_status()
-    return resp.json().get("response", "").strip()
+    return msg.content[0].text.strip()
 
 
 def _extract_keywords_and_query(
     description: str, exp_level: str, location: str
 ) -> tuple[list[str], str | None]:
     """
-    Single Ollama call: extracts keywords AND generates a prestige-targeted LinkedIn
+    Single Claude call: extracts keywords AND generates a prestige-targeted LinkedIn
     search query. Returns (keywords, linkedin_query_or_None).
     """
-    print("[Ollama] Generating keywords + prestige-targeted LinkedIn query...")
+    print("[Claude] Generating keywords + prestige-targeted LinkedIn query...")
     exp_hint = f"Experience level: {exp_level}" if exp_level else ""
     loc_hint = f"Location: {location}" if location else ""
     context = "\n".join(filter(None, [exp_hint, loc_hint]))
@@ -80,8 +83,8 @@ def _extract_keywords_and_query(
         '{"keywords": ["skill1", "skill2"], "linkedin_query": "site:linkedin.com/in ..."}'
     )
     try:
-        raw = _ollama(prompt, timeout=OLLAMA_TIMEOUT)
-        # Find JSON block — model sometimes wraps it in ```json ... ```
+        raw = _claude(prompt)
+        # Find JSON block — Claude may wrap it in ```json ... ```
         m = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)
         if m:
             data = json.loads(m.group(0))
@@ -93,16 +96,16 @@ def _extract_keywords_and_query(
             query = data.get("linkedin_query", "").strip()
             if not query.startswith("site:linkedin.com/in"):
                 query = None
-            print(f"[Ollama] Keywords: {keywords}")
-            print(f"[Ollama] LinkedIn query: {query}")
+            print(f"[Claude] Keywords: {keywords}")
+            print(f"[Claude] LinkedIn query: {query}")
             return keywords, query
     except Exception as e:
-        print(f"[Ollama] Combined extraction failed: {e}")
+        print(f"[Claude] Combined extraction failed: {e}")
     return [], None
 
 
 def _analyze_commits(login: str, owner: str, repo: str, commits: list) -> tuple[int, str]:
-    """Score a developer's commit quality via Ollama. Returns (score 0-100, summary)."""
+    """Score a developer's commit quality via Claude. Returns (score 0-100, summary)."""
     if not commits:
         return 50, f"Contributor to {owner}/{repo} — no commit data available."
 
@@ -119,7 +122,7 @@ def _analyze_commits(login: str, owner: str, repo: str, commits: list) -> tuple[
         'Return ONLY valid JSON: {"score": 75, "summary": "One sentence about this developer."}'
     )
     try:
-        raw = _ollama(prompt)
+        raw = _claude(prompt)
         m = re.search(r'\{[^{}]*"score"[^{}]*\}', raw, re.DOTALL)
         if m:
             data = json.loads(m.group(0))
@@ -127,7 +130,7 @@ def _analyze_commits(login: str, owner: str, repo: str, commits: list) -> tuple[
             summary = data.get("summary", f"Contributor to {owner}/{repo}.")
             return score, summary
     except Exception as e:
-        print(f"[Ollama] Commit analysis failed for @{login}: {e}")
+        print(f"[Claude] Commit analysis failed for @{login}: {e}")
     return 50, f"Active contributor to {owner}/{repo} with {len(commits)} analyzed commits."
 
 
@@ -164,46 +167,81 @@ def _build_linkedin_query(filters: SearchFilters) -> str:
     return f"site:linkedin.com/in {base} {prestige}"
 
 
-# ── Prestige scoring ──────────────────────────────────────────────────
-_PRESTIGE_COMPANIES = {
-    "google", "deepmind", "google deepmind", "openai", "anthropic", "meta", "facebook",
-    "microsoft", "apple", "amazon", "aws", "nvidia", "tesla", "spacex", "netflix",
-    "stripe", "databricks", "hugging face", "huggingface", "cohere", "mistral",
+# ── Prestige scoring (tiered so scores spread out) ────────────────────
+# Company tiers — different scores create differentiation between candidates
+_PRESTIGE_COMPANIES_T1 = {  # 40 pts — most elite
+    "google", "deepmind", "google deepmind", "openai", "anthropic", "apple", "nvidia",
+    "google brain", "google research",
+}
+_PRESTIGE_COMPANIES_T2 = {  # 30 pts — top-tier
+    "meta", "facebook", "microsoft", "amazon", "aws", "tesla", "spacex",
+    "stripe", "databricks", "jane street", "two sigma", "citadel",
+    "microsoft research", "fair", "msr", "xai", "deepseek",
+}
+_PRESTIGE_COMPANIES_T3 = {  # 20 pts — prestigious
+    "netflix", "hugging face", "huggingface", "cohere", "mistral",
     "stability ai", "scale ai", "anyscale", "replicate", "weights & biases", "wandb",
-    "fair", "msr", "microsoft research", "google brain", "google research",
-    "allen institute", "ai2", "jane street", "two sigma", "citadel", "d.e. shaw",
-    "renaissance", "palantir", "mckinsey", "goldman sachs", "jp morgan",
-    "deepseek", "xai", "inflection", "adept", "together ai",
+    "allen institute", "ai2", "d.e. shaw", "renaissance", "palantir",
+    "mckinsey", "goldman sachs", "jp morgan", "inflection", "adept", "together ai",
 }
 
-_PRESTIGE_SCHOOLS = {
+# School tiers
+_PRESTIGE_SCHOOLS_T1 = {  # 20 pts
     "mit", "stanford", "carnegie mellon", "cmu", "harvard", "caltech",
-    "berkeley", "uc berkeley", "cambridge", "oxford", "eth zurich",
-    "imperial college", "imperial", "princeton", "yale", "columbia",
-    "georgia tech", "gatech", "cornell", "toronto", "waterloo",
-    "university of toronto", "university of cambridge", "university of oxford",
-    "tsinghua", "peking university", "epfl",
+    "berkeley", "uc berkeley", "eth zurich", "epfl",
+}
+_PRESTIGE_SCHOOLS_T2 = {  # 12 pts
+    "cambridge", "oxford", "imperial college", "imperial", "princeton",
+    "yale", "columbia", "georgia tech", "gatech", "cornell",
+    "toronto", "waterloo", "university of toronto", "university of cambridge",
+    "university of oxford", "tsinghua", "peking university",
 }
 
-
-_RESEARCH_TERMS = {
-    "phd", "ph.d", "ph.d.", "researcher", "research scientist", "research engineer",
-    "research lead", "research director", "professor", "postdoc", "postdoctoral",
-    "doctoral", "dissertation", "publications", "published", "arxiv",
-    "paper", "papers", "co-author", "first author", "principal investigator",
+# Research signal tiers
+_RESEARCH_STRONG = {  # 20 pts
+    "phd", "ph.d", "ph.d.", "research scientist", "research engineer",
+    "professor", "postdoc", "postdoctoral", "doctoral",
     "machine learning researcher", "ai researcher", "deep learning researcher",
+    "principal investigator",
+}
+_RESEARCH_MILD = {  # 10 pts
+    "researcher", "research lead", "research director",
+    "dissertation", "publications", "published", "arxiv",
+    "paper", "papers", "co-author", "first author",
 }
 
 
 def _compute_prestige_breakdown(text: str) -> tuple[int, int, int]:
     """
-    Returns (company_score 0-30, school_score 0-20, research_score 0-20).
-    All three stack — a Stanford PhD at Nvidia = 30+20+20 = 70 prestige points.
+    Returns (company_score, school_score, research_score) — all tiered.
+    Company: T1=40, T2=30, T3=20. School: T1=20, T2=12. Research: strong=20, mild=10.
+    All three stack — Google (40) + MIT (20) + PhD (20) = 80 prestige points.
     """
     lowered = text.lower()
-    company = 35 if any(c in lowered for c in _PRESTIGE_COMPANIES) else 0
-    school = 20 if any(s in lowered for s in _PRESTIGE_SCHOOLS) else 0
-    research = 20 if any(t in lowered for t in _RESEARCH_TERMS) else 0
+
+    if any(c in lowered for c in _PRESTIGE_COMPANIES_T1):
+        company = 40
+    elif any(c in lowered for c in _PRESTIGE_COMPANIES_T2):
+        company = 30
+    elif any(c in lowered for c in _PRESTIGE_COMPANIES_T3):
+        company = 20
+    else:
+        company = 0
+
+    if any(s in lowered for s in _PRESTIGE_SCHOOLS_T1):
+        school = 20
+    elif any(s in lowered for s in _PRESTIGE_SCHOOLS_T2):
+        school = 12
+    else:
+        school = 0
+
+    if any(t in lowered for t in _RESEARCH_STRONG):
+        research = 20
+    elif any(t in lowered for t in _RESEARCH_MILD):
+        research = 10
+    else:
+        research = 0
+
     return company, school, research
 
 
@@ -348,20 +386,21 @@ def _score_linkedin(matched_skills: list[str], total_skills: int, exp_level: str
                     research_score: int = 0) -> tuple[int, str]:
     """Score a LinkedIn candidate 1-100.
 
-    Prestige (company + school + research) is the dominant signal. Scores are
-    calibrated so top-tier candidates land 90-100 and typical LinkedIn hits 30-50.
+    Prestige (company + school + research) is the dominant signal. Tiered scoring
+    creates natural spread: T1 company=40, T2=30, T3=20; T1 school=20, T2=12;
+    strong research=20, mild=10.
       linkedin bonus : 20     (always — verified professional profile baseline)
-      prestige total : 0–72   (company 35 + school 20 + research 20, all stacking)
+      prestige total : 0–80   (T1 company 40 + T1 school 20 + strong research 20)
       skill match    : 0–12
       exp level      : 0–6
       location match : 0–3
-    Total max ≈ 113 → capped at 100
+    Total max ≈ 121 → capped at 100
     """
     skill_score = int((len(matched_skills) / max(total_skills, 1)) * 12)  # 0-12
     exp_score = 6 if (required_exp and required_exp.lower() in exp_level.lower()) else 0
     loc_score = 3 if (required_loc and required_loc.lower() in location.lower()) else 0
     linkedin_bonus = 20
-    prestige_total = min(72, company_prestige + school_prestige + research_score)
+    prestige_total = min(80, company_prestige + school_prestige + research_score)
 
     score = max(1, min(100, skill_score + exp_score + loc_score + linkedin_bonus + prestige_total))
 
@@ -598,21 +637,21 @@ async def stream_candidate_search(filters: SearchFilters):
             }
             return
 
-    # Step 1: Extract keywords + generate prestige-targeted LinkedIn query via Ollama
+    # Step 1: Extract keywords + generate prestige-targeted LinkedIn query via Claude
     skills = list(filters.skills)
-    ollama_linkedin_query: str | None = None
+    ai_linkedin_query: str | None = None
 
     if filters.description and filters.description.strip():
         yield {"type": "progress", "stage": "analyze", "message": "Analyzing your requirements with AI..."}
         try:
-            extracted, ollama_linkedin_query = await asyncio.wait_for(
+            extracted, ai_linkedin_query = await asyncio.wait_for(
                 asyncio.to_thread(
                     _extract_keywords_and_query,
                     filters.description,
                     filters.experience_level or "",
                     filters.location or "",
                 ),
-                timeout=float(OLLAMA_TIMEOUT),
+                timeout=float(CLAUDE_TIMEOUT),
             )
             seen_lower = {s.lower() for s in skills}
             for kw in extracted:
@@ -621,11 +660,11 @@ async def stream_candidate_search(filters: SearchFilters):
                     seen_lower.add(kw.lower())
             print(f"[Search] Final skills: {skills}")
         except Exception as e:
-            print(f"[Ollama] Skipping extraction: {e}")
+            print(f"[Claude] Skipping extraction: {e}")
 
     merged_filters = filters.model_copy(update={"skills": skills})
-    # Use Ollama-generated prestige query if available; fall back to deterministic builder
-    linkedin_query = ollama_linkedin_query or _build_linkedin_query(merged_filters)
+    # Use Claude-generated prestige query if available; fall back to deterministic builder
+    linkedin_query = ai_linkedin_query or _build_linkedin_query(merged_filters)
     print(f"[Search] LinkedIn query: {linkedin_query}")
     print(f"[Search] GitHub skills: {skills}")
 

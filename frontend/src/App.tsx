@@ -100,7 +100,7 @@ export default function App() {
                             </svg>
                         </div>
                         <div>
-                            <h1>TalentScope</h1>
+                            <h1>Talentier</h1>
                             <span className="tagline">AI-Powered Candidate Discovery</span>
                         </div>
                     </div>
