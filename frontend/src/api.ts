@@ -1,19 +1,34 @@
 /** API client for the FastAPI backend. */
 
-import type { Candidate, SearchFilters, SearchResponse } from "./types";
+import type { Candidate, SearchFilters } from "./types";
 
 const API_BASE = "http://localhost:8000";
 
-export interface AgentStep {
-    type: "start" | "thinking" | "searching" | "success" | "refining" | "error" | "done";
+export interface ProgressEvent {
+    type: "progress";
+    stage: string;
     message: string;
-    detail: string;
+    detail?: string;
 }
 
-export async function searchCandidates(
+export interface ResultsEvent {
+    type: "results";
+    candidates: Candidate[];
+    total_results: number;
+    has_more: boolean;
+}
+
+/**
+ * Stream candidate search results via SSE.
+ * Returns an unsubscribe function.
+ */
+export function streamCandidates(
     filters: SearchFilters,
-    page: number = 1
-): Promise<SearchResponse> {
+    onProgress: (stage: string, message: string, detail?: string) => void,
+    onResults: (candidates: Candidate[], total: number) => void,
+    onError: (message: string) => void,
+    onDone: () => void,
+): () => void {
     const params = new URLSearchParams();
 
     if (filters.skills.length > 0) {
@@ -28,62 +43,21 @@ export async function searchCandidates(
     if (filters.description) {
         params.set("description", filters.description);
     }
-    params.set("page", String(page));
 
-    const resp = await fetch(`${API_BASE}/api/pipeline?${params.toString()}`);
-    if (!resp.ok) {
-        throw new Error(`API error: ${resp.status}`);
-    }
-
-    const data = await resp.json();
-
-    // Map pipeline response to SearchResponse shape
-    const candidates: Candidate[] = (data.candidates ?? []).map((c: any) => {
-        const bestUrl =
-            c.profile_urls?.linkedin ||
-            c.profile_urls?.github ||
-            Object.values(c.profile_urls ?? {})[0] ||
-            "";
-        const nameParts = (c.name ?? "Unknown").split(" ");
-        const initials = nameParts
-            .slice(0, 2)
-            .map((p: string) => p[0]?.toUpperCase() ?? "")
-            .join("");
-
-        return {
-            id: c.canonical_id ?? "",
-            name: c.name ?? "Unknown",
-            headline: c.headline ?? "",
-            location: c.location ?? "",
-            profile_url: bestUrl,
-            snippet: c.final_score != null ? `Score: ${c.final_score}` : "",
-            matched_skills: c.skills ?? [],
-            avatar_initials: initials,
-        } satisfies Candidate;
-    });
-
-    return {
-        candidates,
-        total_results: data.total ?? candidates.length,
-        page,
-        has_more: false,
-    };
-}
-
-export function subscribeAgentStatus(
-    onStep: (step: AgentStep) => void,
-    onDone: () => void
-): () => void {
-    const evtSource = new EventSource(`${API_BASE}/api/agent-status`);
+    const url = `${API_BASE}/api/candidates/stream?${params.toString()}`;
+    const evtSource = new EventSource(url);
 
     evtSource.onmessage = (event) => {
         try {
-            const step: AgentStep = JSON.parse(event.data);
-            if (step.type === "done") {
-                onDone();
+            const data = JSON.parse(event.data);
+
+            if (data.type === "progress") {
+                onProgress(data.stage ?? "", data.message ?? "", data.detail);
+            } else if (data.type === "results") {
+                onResults(data.candidates ?? [], data.total_results ?? 0);
+            } else if (data.type === "done") {
                 evtSource.close();
-            } else {
-                onStep(step);
+                onDone();
             }
         } catch {
             // ignore parse errors
@@ -92,6 +66,7 @@ export function subscribeAgentStatus(
 
     evtSource.onerror = () => {
         evtSource.close();
+        onError("Connection lost. Please try again.");
         onDone();
     };
 

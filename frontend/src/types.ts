@@ -6,9 +6,15 @@ export interface Candidate {
     headline: string;
     location: string;
     profile_url: string;
+    linkedin_url?: string;
+    github_url?: string;
     snippet: string;
     matched_skills: string[];
     avatar_initials: string;
+    score: number;
+    code_quality_score?: number;
+    summary: string;
+    source: string; // "linkedin" | "github"
 }
 
 export interface SearchFilters {
@@ -16,11 +22,4 @@ export interface SearchFilters {
     experience_level: string;
     location: string;
     description: string;
-}
-
-export interface SearchResponse {
-    candidates: Candidate[];
-    total_results: number;
-    page: number;
-    has_more: boolean;
 }

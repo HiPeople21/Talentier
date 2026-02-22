@@ -24,9 +24,15 @@ class Candidate(BaseModel):
     headline: str
     location: str
     profile_url: str
+    linkedin_url: Optional[str] = None
+    github_url: Optional[str] = None
     snippet: str
     matched_skills: list[str] = []
     avatar_initials: str = ""
+    score: int = 0
+    code_quality_score: Optional[int] = None
+    summary: str = ""
+    source: str = ""  # "linkedin" | "github"
 
 
 class SearchResponse(BaseModel):

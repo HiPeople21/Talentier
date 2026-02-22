@@ -1162,6 +1162,263 @@ body {
   color: var(--text-primary);
 }
 
+/* ---- Score Badges ---- */
+.score-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+}
+
+.score-high {
+  background: rgba(34, 197, 94, 0.18);
+  border: 1px solid rgba(34, 197, 94, 0.4);
+  color: #4ade80;
+}
+
+.score-mid {
+  background: rgba(251, 191, 36, 0.15);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  color: #fbbf24;
+}
+
+.score-low {
+  background: rgba(148, 163, 184, 0.12);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  color: var(--text-muted);
+}
+
+/* ---- Source Badges ---- */
+.source-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.source-linkedin {
+  background: rgba(10, 102, 194, 0.15);
+  border: 1px solid rgba(10, 102, 194, 0.35);
+  color: #60a5fa;
+}
+
+.source-github {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: var(--text-secondary);
+}
+
+/* ---- Row layout updates ---- */
+.row-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.row-summary {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.row-score-skills {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* ---- Candidate summary in card ---- */
+.candidate-summary {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin-top: 6px;
+  font-style: italic;
+}
+
+/* ---- Card header badges ---- */
+.card-name-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.card-badges {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* ---- GitHub link (like linkedin-link but different color) ---- */
+.github-link {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  font-weight: 500;
+  text-decoration: none;
+  transition: color var(--transition-fast);
+}
+
+.github-link:hover {
+  color: var(--text-primary);
+}
+
+/* ---- Modal: score section ---- */
+.modal-header-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.modal-name-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.modal-badges {
+  display: flex;
+  gap: 6px;
+}
+
+.modal-score-section {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 18px;
+  background: var(--bg-glass);
+  border: 1px solid var(--border-glass);
+  border-radius: var(--radius-md);
+  margin-bottom: 20px;
+}
+
+.modal-score-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 16px;
+  border-radius: var(--radius-md);
+  flex-shrink: 0;
+}
+
+.modal-score-badge.score-high {
+  background: rgba(34, 197, 94, 0.15);
+  border: 1px solid rgba(34, 197, 94, 0.35);
+}
+
+.modal-score-badge.score-mid {
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+}
+
+.modal-score-badge.score-low {
+  background: rgba(148, 163, 184, 0.1);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.modal-score-number {
+  font-size: 1.8rem;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.score-high .modal-score-number { color: #4ade80; }
+.score-mid .modal-score-number { color: #fbbf24; }
+.score-low .modal-score-number { color: var(--text-muted); }
+
+.modal-score-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 2px;
+  color: var(--text-muted);
+}
+
+.modal-code-quality {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.code-quality-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.code-quality-bar-wrap {
+  height: 6px;
+  background: var(--bg-glass-hover);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.code-quality-bar {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.6s ease;
+}
+
+.code-quality-bar.score-high { background: #4ade80; }
+.code-quality-bar.score-mid { background: #fbbf24; }
+.code-quality-bar.score-low { background: var(--text-muted); }
+
+.code-quality-value {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+/* ---- Modal: AI summary ---- */
+.modal-summary {
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+  line-height: 1.7;
+  font-style: italic;
+}
+
+/* ---- Modal: platform-specific buttons ---- */
+.btn-linkedin {
+  background: #0a66c2;
+}
+
+.btn-linkedin:hover {
+  background: #0077b5;
+  box-shadow: 0 4px 12px rgba(10, 102, 194, 0.4);
+}
+
+.btn-github {
+  background: #24292e;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.btn-github:hover {
+  background: #2d3339;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
 /* ---- Responsive ---- */
 @media (max-width: 900px) {
   .app-main {
@@ -1180,7 +1437,7 @@ body {
   }
 
   .row-location,
-  .row-skills,
+  .row-score-skills,
   .candidate-row.row-header {
     display: none;
   }
