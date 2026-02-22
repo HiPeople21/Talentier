@@ -6,8 +6,14 @@ from langgraph.graph import StateGraph, END
 from langchain_ollama import OllamaLLM
 import json
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from models import CodeQualityMetric
+
+LLM_MAX_RETRIES = 3
+LLM_RETRY_BACKOFF = 2  # seconds (doubled each attempt)
+LLM_TIMEOUT = 120  # seconds per invocation
 
 
 # ============================================================================
@@ -128,7 +134,25 @@ Provide ONLY a JSON response with numeric grades and critical issues:
 Be objective and consistent. Base scores on concrete observations from the code."""
             
             print(f"[CODE QUALITY] Sending prompt to LLM...")
-            analysis = self.llm.invoke(prompt)
+            last_err = None
+            for attempt in range(1, LLM_MAX_RETRIES + 1):
+                try:
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(self.llm.invoke, prompt)
+                        analysis = future.result(timeout=LLM_TIMEOUT)
+                    break
+                except FuturesTimeoutError:
+                    last_err = TimeoutError(f"LLM call timed out after {LLM_TIMEOUT}s")
+                    print(f"[CODE QUALITY] LLM attempt {attempt}/{LLM_MAX_RETRIES} timed out after {LLM_TIMEOUT}s.")
+                except Exception as exc:
+                    last_err = exc
+                    print(f"[CODE QUALITY] LLM attempt {attempt}/{LLM_MAX_RETRIES} failed: {exc}.")
+                if attempt < LLM_MAX_RETRIES:
+                    wait = LLM_RETRY_BACKOFF * (2 ** (attempt - 1))
+                    print(f"[CODE QUALITY] Retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    raise last_err
             print(f"[CODE QUALITY] LLM grading completed, response length: {len(analysis)} characters")
             state["analysis"] = analysis
             

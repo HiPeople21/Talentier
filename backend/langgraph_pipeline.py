@@ -906,24 +906,24 @@ def create_candidate_sourcing_graph():
     graph = StateGraph(CandidateSourcingState)
     
     # Add nodes
-    graph.add_node("linkedin_query", linkedin_query_node)
-    graph.add_node("linkedin_scoring", linkedin_scoring_node)
+    # graph.add_node("linkedin_query", linkedin_query_node)
+    # graph.add_node("linkedin_scoring", linkedin_scoring_node)
     graph.add_node("github_query", github_query_node)
     graph.add_node("github_scoring", github_scoring_node)
     graph.add_node("identity_resolution", identity_resolution_node)
     graph.add_node("aggregation", aggregation_node)
     graph.add_node("ranking", ranking_node)
     
-    # Parallel execution: START → linkedin_query AND github_query
-    graph.add_edge(START, "linkedin_query")
+    # LinkedIn disabled for now
+    # graph.add_edge(START, "linkedin_query")
     graph.add_edge(START, "github_query")
     
     # Sequential within each source
-    graph.add_edge("linkedin_query", "linkedin_scoring")
+    # graph.add_edge("linkedin_query", "linkedin_scoring")
     graph.add_edge("github_query", "github_scoring")
     
     # Merge point: both sources → identity_resolution
-    graph.add_edge("linkedin_scoring", "identity_resolution")
+    # graph.add_edge("linkedin_scoring", "identity_resolution")
     graph.add_edge("github_scoring", "identity_resolution")
     
     # Sequential aggregation → ranking → END

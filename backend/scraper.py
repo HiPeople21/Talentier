@@ -21,7 +21,7 @@ import re
 import subprocess
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -52,7 +52,35 @@ llm = ChatOllama(
     model=OLLAMA_MODEL,
     temperature=0.7,
     num_predict=3072,
+    verbose=True,
 )
+
+LLM_MAX_RETRIES = 3
+LLM_RETRY_BACKOFF = 2  # seconds (doubled each attempt)
+LLM_TIMEOUT = 120  # seconds per invocation
+
+
+def _llm_invoke_with_retry(messages, *, max_retries: int = LLM_MAX_RETRIES, timeout: int = LLM_TIMEOUT):
+    """Invoke the LLM with automatic retry, exponential backoff, and per-call timeout."""
+    last_err: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(llm.invoke, messages)
+                return future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            last_err = TimeoutError(f"LLM call timed out after {timeout}s")
+            print(f"[LLM Retry] Attempt {attempt}/{max_retries} timed out after {timeout}s.")
+        except Exception as exc:
+            last_err = exc
+            print(f"[LLM Retry] Attempt {attempt}/{max_retries} failed: {exc}.")
+        if attempt < max_retries:
+            wait = LLM_RETRY_BACKOFF * (2 ** (attempt - 1))
+            print(f"[LLM Retry] Retrying in {wait}s...")
+            time.sleep(wait)
+        else:
+            print(f"[LLM Retry] All {max_retries} attempts exhausted.")
+    raise last_err
 
 # ── Header Rotation Pool ─────────────────────────────────────────────
 _USER_AGENTS = [
@@ -754,7 +782,7 @@ def plan_search_terms(
 
     _emit("thinking", "Planning search query...", "Analyzing filters to build optimal search")
     print("[Scraper] Planning search query...")
-    response = llm.invoke(messages)
+    response = _llm_invoke_with_retry(messages)
     query = response.content.strip().strip('"').strip("'").strip("`").splitlines()[0].strip()
 
     _emit("success", f"Search terms ready", query)
@@ -931,6 +959,7 @@ def enrich_candidates_llm(
 
     all_enriched: list[dict] = []
     for batch_start in range(0, len(candidates), ENRICH_BATCH_SIZE):
+        print("[Scraper] Enriching batch %d to %d..." % (batch_start, min(batch_start + ENRICH_BATCH_SIZE, len(candidates))))
         batch = candidates[batch_start : batch_start + ENRICH_BATCH_SIZE]
         messages = [
             SystemMessage(content=system_prompt),
@@ -942,7 +971,7 @@ def enrich_candidates_llm(
                 f"Candidates:\n{json.dumps(batch, indent=2)}"
             )),
         ]
-        response = llm.invoke(messages)
+        response = _llm_invoke_with_retry(messages)
         enriched = _extract_json(response.content)
         if isinstance(enriched, dict):
             enriched = [enriched]
@@ -1017,7 +1046,7 @@ def evaluate_candidates_llm(
                 f"Candidates:\n{json.dumps(indexed_batch, indent=2)}"
             )),
         ]
-        response = llm.invoke(messages)
+        response = _llm_invoke_with_retry(messages)
         evaluations = _extract_json(response.content)
         if not isinstance(evaluations, list):
             evaluations = []
