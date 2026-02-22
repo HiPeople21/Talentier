@@ -1,15 +1,18 @@
 """
-LangGraph-powered agentic candidate discovery using REAL data.
+Candidate discovery utility module.
 
-Uses DuckDuckGo (via DDGS library) + Brave Search to find actual
-LinkedIn profiles, Google Scholar profiles, and GitHub contributors,
-then uses the Ollama LLM agent to enrich and rank them.
+Provides standalone functions for multi-source candidate search
+(LinkedIn, Google Scholar, GitHub) via DuckDuckGo + Brave Search,
+and LLM-powered enrichment / ranking via Ollama.
 
-Agent graph:
-  plan_search → search_sources → enrich → evaluate → decide → [refine] or [finalize]
+Exported functions (called by the unified pipeline):
+  plan_search_terms      – LLM generates search terms from skills/description
+  discover_candidates    – multi-source discovery across LinkedIn, Scholar, GitHub
+  enrich_candidates_llm  – LLM cleans and enriches raw profiles
+  evaluate_candidates_llm – LLM scores candidates 1-10
+  finalize_candidates    – deduplicates and caps results
 """
 
-import asyncio
 import datetime
 import hashlib
 import json
@@ -19,7 +22,6 @@ import subprocess
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Literal
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -28,17 +30,11 @@ from ddgs import DDGS
 from github.tools import get_github_tools
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
-from langgraph.graph import END, StateGraph
-from typing_extensions import TypedDict
-
-from models import Candidate, SearchFilters
 
 # ── Config ────────────────────────────────────────────────────────────
 OLLAMA_MODEL = "llama3.2"  # 2GB — ~2x faster than qwen2.5 while still capable
 MAX_REFINE_LOOPS = 2
 CACHE_TTL = 300
-
-_cache: dict[str, tuple[float, list[Candidate]]] = {}
 
 # ── Agent status (shared with SSE endpoint) ───────────────────────────
 agent_status: dict = {"steps": [], "done": True}
@@ -143,20 +139,6 @@ ENRICH_BATCH_SIZE = 25      # Process at most this many candidates per LLM call
 
 _scholar_quality_cache: dict[str, bool] = {}
 _github_quality_cache: dict[str, bool] = {}
-
-
-# ── Agent State ───────────────────────────────────────────────────────
-class AgentState(TypedDict):
-    filters: dict
-    search_query: str
-    raw_results: list[dict]
-    parsed_candidates: list[dict]
-    enriched_candidates: list[dict]
-    evaluated_candidates: list[dict]
-    refinement_feedback: str
-    refinement_count: int
-    _prev_candidate_count: int
-    final_candidates: list[dict]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -730,17 +712,21 @@ def _build_linkedin_queries(terms: str, filters: dict) -> list[str]:
     return deduped[:16]
 
 
-# ── Node 1: Plan Search (LLM) ────────────────────────────────────────
-def plan_search(state: AgentState) -> dict:
-    """LLM plans the core skill/domain search terms."""
-    filters = state["filters"]
-    skills = ", ".join(filters.get("skills", []))
-    description = filters.get("description", "")
-    refinement = state.get("refinement_feedback", "")
+# ══════════════════════════════════════════════════════════════════════
+# Standalone utility functions (called by the pipeline)
+# ══════════════════════════════════════════════════════════════════════
+
+def plan_search_terms(
+    skills: list[str],
+    description: str = "",
+    refinement_feedback: str = "",
+) -> str:
+    """Use LLM to generate compact search terms from skills/description."""
+    skills_str = ", ".join(skills)
 
     refinement_note = ""
-    if refinement:
-        refinement_note = f"\n\nPrevious search had issues: {refinement}\nBroaden or adjust accordingly."
+    if refinement_feedback:
+        refinement_note = f"\n\nPrevious search had issues: {refinement_feedback}\nBroaden or adjust accordingly."
 
     description_note = ""
     if description:
@@ -751,39 +737,42 @@ def plan_search(state: AgentState) -> dict:
             "You are a recruitment search specialist. Produce compact skill/domain "
             "search terms to find candidates across LinkedIn, Google Scholar, and GitHub.\n\n"
             "Rules:\n"
-            "1. Focus on the 1–3 most important skills or technologies\n"
+            "1. Focus on the 1-3 most important skills or technologies\n"
             "2. Do NOT include experience level (junior/senior/etc.) — we want all levels\n"
             "3. Do NOT include location — location is handled separately\n"
             "4. Return ONLY the search terms string — nothing else\n"
-            "5. Keep it concise: 2–6 words"
+            "5. Keep it concise: 2-6 words"
             f"{description_note}\n\n"
             "Example: 'python machine learning' or 'react typescript frontend'"
         )),
         HumanMessage(content=(
-            f"Skills: {skills or 'any'}\n"
+            f"Skills: {skills_str or 'any'}\n"
             f"Description: {description or 'none'}"
             f"{refinement_note}"
         )),
     ]
 
     _emit("thinking", "Planning search query...", "Analyzing filters to build optimal search")
-    print("[Agent] 🧠 Planning search query...")
+    print("[Scraper] Planning search query...")
     response = llm.invoke(messages)
     query = response.content.strip().strip('"').strip("'").strip("`").splitlines()[0].strip()
 
     _emit("success", f"Search terms ready", query)
-    print(f"[Agent] ✅ Planned terms: {query}")
-    return {"search_query": query}
+    print(f"[Scraper] Planned terms: {query}")
+    return query
 
 
-# ── Node 2: Search Sources (DDG + Brave + Scholar + GitHub) ──────────
-def search_sources(state: AgentState) -> dict:
-    """Two-phase candidate discovery across LinkedIn, Scholar, and GitHub."""
-    base_query = state["search_query"]
-    filters = state["filters"]
+def discover_candidates(
+    search_terms: str,
+    filters: dict,
+) -> list[dict]:
+    """
+    Two-phase candidate discovery across LinkedIn, Scholar, and GitHub.
+
+    Returns a list of parsed candidate dicts (not yet enriched).
+    """
     skills = filters.get("skills", [])
-
-    terms = base_query.strip() or "software engineer"
+    terms = search_terms.strip() or "software engineer"
 
     linkedin_queries = _build_linkedin_queries(terms, filters)
     scholar_query = SCHOLAR_DISCOVERY_TEMPLATE.format(terms=terms)
@@ -812,7 +801,6 @@ def search_sources(state: AgentState) -> dict:
             all_linkedin_raw.extend(results)
 
     scholar_paper_raw = phase1_results.get("scholar_papers", [])
-    all_raw_results = all_linkedin_raw + scholar_paper_raw
 
     # ── Extract author names from Scholar discovery results ───────────
     author_names: list[str] = []
@@ -908,26 +896,22 @@ def search_sources(state: AgentState) -> dict:
         f"LinkedIn: {len(linkedin_candidates)}, Scholar: {len(scholar_candidates)}, GitHub: {len(github_candidates)}",
     )
     print(
-        f"[Agent] {len(candidates)} unique profiles "
-        f"(LinkedIn: {len(linkedin_candidates)} from {len(linkedin_queries)} queries, "
+        f"[Scraper] {len(candidates)} unique profiles "
+        f"(LinkedIn: {len(linkedin_candidates)}, "
         f"Scholar: {len(scholar_candidates)}, "
         f"GitHub/Personal: {len(github_candidates)})"
     )
 
-    return {
-        "raw_results": all_raw_results,
-        "parsed_candidates": candidates,
-    }
+    return candidates
 
 
-# ── Node 3: Enrich (LLM) ─────────────────────────────────────────────
-def enrich_candidates(state: AgentState) -> dict:
-    """LLM cleans and enriches the real candidate data, in batches for large pools."""
-    candidates = state["parsed_candidates"]
-    filters = state["filters"]
-
+def enrich_candidates_llm(
+    candidates: list[dict],
+    filters: dict,
+) -> list[dict]:
+    """LLM cleans and enriches candidate data, in batches."""
     if not candidates:
-        return {"enriched_candidates": []}
+        return []
 
     system_prompt = (
         "You are a recruitment data analyst. Clean and enrich these REAL candidate "
@@ -943,7 +927,7 @@ def enrich_candidates(state: AgentState) -> dict:
     )
 
     _emit("thinking", "Enriching candidate profiles...", "Cleaning data and extracting experience levels")
-    print("[Agent] 🧠 Enriching candidate data...")
+    print("[Scraper] Enriching candidate data...")
 
     all_enriched: list[dict] = []
     for batch_start in range(0, len(candidates), ENRICH_BATCH_SIZE):
@@ -972,8 +956,8 @@ def enrich_candidates(state: AgentState) -> dict:
         else:
             all_enriched.extend(batch)
 
-    # Deduplicate enriched candidates by URL and by normalized name
-    deduped_enriched: list[dict] = []
+    # Deduplicate by URL and by normalized name
+    deduped: list[dict] = []
     seen_urls: set[str] = set()
     seen_names: set[str] = set()
     for c in all_enriched:
@@ -987,25 +971,20 @@ def enrich_candidates(state: AgentState) -> dict:
             seen_urls.add(url_key)
         if name_key:
             seen_names.add(name_key)
-        deduped_enriched.append(c)
+        deduped.append(c)
 
-    count = len(deduped_enriched)
-    _emit("success", f"Enriched {count} candidate profiles", "Data cleaned and structured")
-    print(f"[Agent] ✅ {count} candidates enriched (deduped from {len(all_enriched)})")
-    return {"enriched_candidates": deduped_enriched}
+    _emit("success", f"Enriched {len(deduped)} candidate profiles", "Data cleaned and structured")
+    print(f"[Scraper] {len(deduped)} candidates enriched (deduped from {len(all_enriched)})")
+    return deduped
 
 
-# ── Node 4: Evaluate (LLM) ───────────────────────────────────────────
-def evaluate_candidates(state: AgentState) -> dict:
-    """LLM scores and ranks candidates by relevance, in batches for large pools."""
-    candidates = state["enriched_candidates"]
-    filters = state["filters"]
-
+def evaluate_candidates_llm(
+    candidates: list[dict],
+    filters: dict,
+) -> list[dict]:
+    """LLM scores and ranks candidates 1-10 by relevance, in batches."""
     if not candidates:
-        return {
-            "evaluated_candidates": [],
-            "refinement_feedback": "No candidate profiles found. Try broader skills.",
-        }
+        return []
 
     system_prompt = (
         "You are a senior tech recruiter evaluating REAL candidates from LinkedIn, "
@@ -1022,7 +1001,7 @@ def evaluate_candidates(state: AgentState) -> dict:
     )
 
     _emit("thinking", "Evaluating and ranking candidates...", "Scoring each candidate on skill match, experience, and relevance")
-    print("[Agent] 🧠 Evaluating and ranking candidates...")
+    print("[Scraper] Evaluating and ranking candidates...")
 
     eval_map: dict[int, dict] = {}
     for batch_start in range(0, len(candidates), ENRICH_BATCH_SIZE):
@@ -1056,58 +1035,15 @@ def evaluate_candidates(state: AgentState) -> dict:
 
     evaluated.sort(key=lambda x: x.get("_score", 0), reverse=True)
 
-    top_count = sum(1 for c in evaluated if c.get("_score", 0) >= MIN_CANDIDATE_SCORE)
-    feedback = ""
-    if top_count < 3:
-        feedback = "Too few qualified results. Broaden the query — fewer skills, drop location."
-
     _emit("success", f"Ranked {len(evaluated)} candidates by relevance", "Candidates sorted by match score")
-    print(f"[Agent] ✅ {len(evaluated)} candidates scored and ranked")
-    return {"evaluated_candidates": evaluated, "refinement_feedback": feedback}
+    print(f"[Scraper] {len(evaluated)} candidates scored and ranked")
+    return evaluated
 
 
-# ── Node 5: Decide ───────────────────────────────────────────────────
-def decide(state: AgentState) -> Literal["refine", "finish"]:
-    feedback = state.get("refinement_feedback", "")
-    count = state.get("refinement_count", 0)
-    current_count = len(state.get("evaluated_candidates", []))
-    prev_count = state.get("_prev_candidate_count", 0)
-
-    # Stop if we've hit the max refine loops
-    if count >= MAX_REFINE_LOOPS:
-        _emit("success", "Max refinement attempts reached — finalizing", "")
-        print(f"[Agent] ✅ Reached {MAX_REFINE_LOOPS} refinement attempts — finalizing")
-        return "finish"
-
-    # Stop if refinement didn't find any new candidates
-    if count > 0 and current_count <= prev_count:
-        _emit("success", "No new candidates found in refinement — finalizing", "")
-        print(f"[Agent] ✅ Refinement yielded no new results ({current_count} ≤ {prev_count}) — stopping")
-        return "finish"
-
-    if feedback:
-        _emit("refining", "Refining search...", "Results were insufficient, trying a broader query")
-        print("[Agent] 🔄 Refining — results were insufficient")
-        return "refine"
-
-    _emit("success", "Results look good — finalizing", "")
-    print("[Agent] ✅ Results look good — finalizing")
-    return "finish"
-
-
-def prepare_refinement(state: AgentState) -> dict:
-    return {
-        "refinement_count": state.get("refinement_count", 0) + 1,
-        "_prev_candidate_count": len(state.get("evaluated_candidates", [])),
-    }
-
-
-def finalize(state: AgentState) -> dict:
-    """Return only the top-scoring qualified candidates, deduplicated and capped."""
-    evaluated = state.get("evaluated_candidates", [])
+def finalize_candidates(evaluated: list[dict]) -> list[dict]:
+    """Deduplicate and cap evaluated candidates to the top qualified ones."""
     top = [c for c in evaluated if c.get("_score", 0) >= MIN_CANDIDATE_SCORE]
 
-    # Final dedup by URL and normalized name (catches same person via different URLs)
     final: list[dict] = []
     seen_urls: set[str] = set()
     seen_names: set[str] = set()
@@ -1126,140 +1062,7 @@ def finalize(state: AgentState) -> dict:
 
     final = final[:TOP_CANDIDATES_LIMIT]
     print(
-        f"[Agent] Finalizing: {len(evaluated)} evaluated → "
+        f"[Scraper] Finalized: {len(evaluated)} evaluated → "
         f"{len(final)} unique top candidates (score ≥ {MIN_CANDIDATE_SCORE}, cap {TOP_CANDIDATES_LIMIT})"
     )
-    return {"final_candidates": final}
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Build the LangGraph — fully agentic with LLM-powered nodes
-# ══════════════════════════════════════════════════════════════════════
-def _build_graph() -> StateGraph:
-    graph = StateGraph(AgentState)
-
-    graph.add_node("plan_search", plan_search)
-    graph.add_node("search_sources", search_sources)
-    graph.add_node("enrich", enrich_candidates)
-    graph.add_node("evaluate", evaluate_candidates)
-    graph.add_node("refine", prepare_refinement)
-    graph.add_node("finalize", finalize)
-
-    graph.set_entry_point("plan_search")
-    graph.add_edge("plan_search", "search_sources")
-    graph.add_edge("search_sources", "enrich")
-    graph.add_edge("enrich", "evaluate")
-
-    graph.add_conditional_edges(
-        "evaluate",
-        decide,
-        {"refine": "refine", "finish": "finalize"},
-    )
-
-    graph.add_edge("refine", "plan_search")
-    graph.add_edge("finalize", END)
-
-    return graph
-
-
-agent_graph = _build_graph().compile()
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Public API
-# ══════════════════════════════════════════════════════════════════════
-def _to_candidate(data: dict, search_skills: list[str]) -> Candidate:
-    name = data.get("name", "Unknown")
-    cid = hashlib.md5(f"{name}-{data.get('headline', '')}".encode()).hexdigest()[:12]
-
-    profile_url = data.get("profile_url", "")
-    if not profile_url:
-        slug = re.sub(r"[^a-z0-9-]", "", name.lower().replace(" ", "-"))
-        profile_url = f"https://duckduckgo.com/?q={slug}"
-
-    cand_skills = data.get("matched_skills", [])
-    if not cand_skills:
-        text = f"{data.get('headline', '')} {data.get('snippet', '')}".lower()
-        cand_skills = [s for s in search_skills if s.lower() in text]
-
-    return Candidate(
-        id=cid,
-        name=name,
-        headline=data.get("headline", ""),
-        location=data.get("location", ""),
-        profile_url=profile_url,
-        snippet=data.get("snippet", ""),
-        matched_skills=cand_skills[:6],
-        avatar_initials=_get_initials(name),
-    )
-
-
-async def search_linkedin_profiles(
-    filters: SearchFilters,
-) -> tuple[list[Candidate], bool]:
-    """Run the LangGraph agent to discover candidates across multiple sources."""
-    cache_key = f"{sorted(filters.skills)}:{filters.experience_level}:{filters.location}:{filters.description}:{filters.page}"
-    key = hashlib.md5(cache_key.encode()).hexdigest()
-
-    if key in _cache:
-        ts, cached = _cache[key]
-        if time.time() - ts < CACHE_TTL:
-            return cached, False
-
-    initial_state: AgentState = {
-        "filters": {
-            "skills": filters.skills,
-            "experience_level": filters.experience_level or "",
-            "location": filters.location or "",
-            "description": filters.description or "",
-        },
-        "search_query": "",
-        "raw_results": [],
-        "parsed_candidates": [],
-        "enriched_candidates": [],
-        "evaluated_candidates": [],
-        "refinement_feedback": "",
-        "refinement_count": 0,
-        "_prev_candidate_count": 0,
-        "final_candidates": [],
-    }
-
-    try:
-        # Reset agent status for SSE streaming
-        agent_status["steps"] = []
-        agent_status["done"] = False
-        _emit("start", "Starting AI agent search...", "Initializing LangGraph pipeline")
-
-        print("\n[Agent] 🚀 Starting agentic candidate search...")
-        result = await asyncio.to_thread(agent_graph.invoke, initial_state)
-        raw_list = result.get("final_candidates", [])
-
-        candidates = []
-        seen_urls = set()
-        for data in raw_list:
-            try:
-                candidate = _to_candidate(data, filters.skills)
-                dedupe_key = _canonicalize_url(candidate.profile_url)
-                if dedupe_key and dedupe_key in seen_urls:
-                    continue
-                if dedupe_key:
-                    seen_urls.add(dedupe_key)
-                candidates.append(candidate)
-            except Exception:
-                continue
-
-        print(f"[Agent] 🎯 Done — {len(candidates)} real candidates returned\n")
-
-        if candidates:
-            _cache[key] = (time.time(), candidates)
-
-        agent_status["done"] = True
-        return candidates, False
-
-    except Exception as e:
-        _emit("error", f"Agent error: {str(e)}", "")
-        agent_status["done"] = True
-        print(f"[Agent Error] {e}")
-        import traceback
-        traceback.print_exc()
-        return [], False
+    return final

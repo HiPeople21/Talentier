@@ -9,6 +9,7 @@ from typing import Literal
 import hashlib
 import json
 import math
+import re
 from datetime import datetime, timezone
 
 from state import (
@@ -34,42 +35,103 @@ from github.code_quality_agent import get_code_quality_agent
 # ============================================================================
 
 def linkedin_query_node(state: CandidateSourcingState) -> dict:
-    """Query LinkedIn and populate linkedin_result."""
+    """
+    Discover candidates across LinkedIn, Scholar, and GitHub (via DDG/Brave).
+
+    Calls the scraper utility functions directly:
+      plan_search_terms → discover_candidates → enrich_candidates_llm → finalize_candidates
+    then converts results into SourceCandidate objects for the global state.
+    """
     start_time = datetime.now(timezone.utc)
-    
+
     query_config = state["query_config"]
     skills = query_config.get("skills", [])
-    location = query_config.get("location")
-    description = query_config.get("description")
-    
-    # Generate cache key
-    query_dict = {"skills": skills, "location": location, "description": description}
-    cache_key = hashlib.sha256(json.dumps(query_dict, sort_keys=True).encode()).hexdigest()
-    
+    location = query_config.get("location", "")
+    description = query_config.get("description", "")
+    experience_level = query_config.get("experience_level", "")
+
+    query_dict = {
+        "skills": skills,
+        "location": location,
+        "description": description,
+        "experience_level": experience_level,
+    }
+    cache_key = hashlib.sha256(
+        json.dumps(query_dict, sort_keys=True).encode()
+    ).hexdigest()
+
     try:
-        # Import your existing scraper
-        from scraper import scrape_linkedin
-        
-        # Query LinkedIn
-        raw_candidates = scrape_linkedin(skills, location, description)
-        
-        # Convert to SourceCandidate objects
-        candidates = []
-        for raw in raw_candidates:
+        from scraper import (
+            plan_search_terms,
+            discover_candidates,
+            enrich_candidates_llm,
+            finalize_candidates,
+            _emit,
+            agent_status,
+        )
+
+        # Reset agent status for SSE streaming
+        agent_status["steps"] = []
+        agent_status["done"] = False
+        _emit("start", "Starting AI agent search...", "Initializing candidate discovery")
+
+        # 1. Plan search terms via LLM
+        search_terms = plan_search_terms(skills, description)
+
+        # 2. Discover candidates across LinkedIn, Scholar, GitHub
+        filters_dict = {
+            "skills": skills,
+            "location": location,
+            "description": description,
+            "experience_level": experience_level,
+        }
+        raw_candidates = discover_candidates(search_terms, filters_dict)
+
+        # 3. Enrich via LLM
+        enriched = enrich_candidates_llm(raw_candidates, filters_dict)
+
+        # 4. Finalize (dedup + quality gate + cap)
+        final_list = finalize_candidates(enriched)
+
+        agent_status["done"] = True
+
+        # Convert scraper dicts → SourceCandidate objects
+        candidates: list[SourceCandidate] = []
+        for raw in final_list:
+            name = raw.get("name", "Unknown")
+            profile_url = raw.get("profile_url", "")
+            cid = hashlib.md5(
+                f"{name}-{raw.get('headline', '')}".encode()
+            ).hexdigest()[:12]
+
+            # Detect source from URL
+            source_label = "linkedin"
+            if "scholar.google" in profile_url:
+                source_label = "scholar"
+            elif "github.com" in profile_url:
+                source_label = "github_discovery"
+
             candidate = SourceCandidate(
                 source=SourceType.LINKEDIN,
-                source_id=raw["id"],
-                name=raw["name"],
+                source_id=cid,
+                name=name,
                 headline=raw.get("headline"),
                 location=raw.get("location"),
-                profile_url=raw["profile_url"],
-                snippet=raw.get("snippet"),
+                profile_url=profile_url,
+                bio=raw.get("snippet"),
                 skills=raw.get("matched_skills", []),
-                raw_data=raw,
-                query_fingerprint=cache_key
+                raw_data={
+                    **raw,
+                    "_discovery_source": source_label,
+                },
+                source_specific={
+                    "experience_level": raw.get("experience_level", ""),
+                    "discovery_source": source_label,
+                },
+                query_fingerprint=cache_key,
             )
             candidates.append(candidate)
-        
+
         result = SourceResult(
             source=SourceType.LINKEDIN,
             candidates=candidates,
@@ -79,24 +141,30 @@ def linkedin_query_node(state: CandidateSourcingState) -> dict:
             total_fetched=len(candidates),
             started_at=start_time,
             completed_at=datetime.now(timezone.utc),
-            fetch_time_ms=(datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            fetch_time_ms=(datetime.now(timezone.utc) - start_time).total_seconds() * 1000,
         )
-        
+
         metrics = StageMetrics(
             stage=PipelineStage.SOURCE_QUERY,
             started_at=start_time,
             completed_at=datetime.now(timezone.utc),
             duration_ms=(datetime.now(timezone.utc) - start_time).total_seconds() * 1000,
             items_out=len(candidates),
-            custom={"source": "linkedin"}
+            llm_calls=2,
+            custom={
+                "source": "linkedin",
+                "raw_discovered": len(raw_candidates),
+                "enriched": len(enriched),
+                "final_returned": len(final_list),
+            },
         )
-        
+
         return {
             "linkedin_result": result,
             "stage_metrics": [metrics],
-            "cache_keys": {"linkedin_query": cache_key}
+            "cache_keys": {"linkedin_query": cache_key},
         }
-        
+
     except Exception as e:
         error_dict = {
             "stage": PipelineStage.SOURCE_QUERY,
@@ -104,20 +172,17 @@ def linkedin_query_node(state: CandidateSourcingState) -> dict:
             "error_type": type(e).__name__,
             "message": str(e),
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "recoverable": False
+            "recoverable": False,
         }
-        
+
         result = SourceResult(
             source=SourceType.LINKEDIN,
             query_fingerprint=cache_key,
             status="failed",
-            error=str(e)
+            error=str(e),
         )
-        
-        return {
-            "linkedin_result": result,
-            "errors": [error_dict]
-        }
+
+        return {"linkedin_result": result, "errors": [error_dict]}
 
 
 def github_query_node(state: CandidateSourcingState) -> dict:
@@ -260,41 +325,83 @@ def github_query_node(state: CandidateSourcingState) -> dict:
 
 
 def linkedin_scoring_node(state: CandidateSourcingState) -> dict:
-    """Score LinkedIn candidates using LLM."""
+    """
+    Score LinkedIn candidates using the scraper's LLM evaluation.
+
+    Calls evaluate_candidates_llm on the enriched candidate data stored
+    in each SourceCandidate's raw_data, then converts scores into proper
+    ScoreMetadata objects.
+    """
     start_time = datetime.now(timezone.utc)
-    
+
     result = state["linkedin_result"]
     query_config = state["query_config"]
-    
+
     if result.status != "completed":
         return {}  # Skip if query failed
-    
-    # TODO: Implement LLM scoring
-    # For now, use placeholder scores
-    for i, candidate in enumerate(result.candidates):
-        # Placeholder: score based on skills match
+
+    from scraper import evaluate_candidates_llm
+
+    # Extract the raw enriched dicts that the query node stored
+    raw_dicts = [dict(c.raw_data) for c in result.candidates]
+
+    filters_dict = {
+        "skills": query_config.get("skills", []),
+        "location": query_config.get("location", ""),
+        "description": query_config.get("description", ""),
+        "experience_level": query_config.get("experience_level", ""),
+    }
+
+    # Run LLM evaluation (results come back sorted, but we match by profile_url)
+    evaluated = evaluate_candidates_llm(raw_dicts, filters_dict)
+
+    # Build a lookup from profile_url → (score, reason)
+    score_lookup: dict[str, tuple[float, str]] = {}
+    for ev in evaluated:
+        url = ev.get("profile_url", "")
+        if url:
+            score_lookup[url] = (ev.get("_score", 5), ev.get("_reason", ""))
+
+    for candidate in result.candidates:
+        scraper_score, scraper_reason = score_lookup.get(
+            candidate.profile_url, (5, "Not evaluated")
+        )
+        discovery_source = candidate.raw_data.get("_discovery_source", "linkedin")
+
+        # Convert 1-10 scraper score → 0-100 raw score
+        raw_score = float(scraper_score) * 10.0
+
+        # Skills match bonus
         matched_skills = set(candidate.skills) & set(query_config.get("skills", []))
-        raw_score = (len(matched_skills) / max(len(query_config.get("skills", [])), 1)) * 100
-        
+        total_skills = max(len(query_config.get("skills", [])), 1)
+        skills_match_pct = (len(matched_skills) / total_skills) * 100
+
+        component_scores = {
+            "llm_relevance": raw_score,
+            "skills_match": round(skills_match_pct, 2),
+            "discovery_source": discovery_source,
+        }
+
         score_metadata = ScoreMetadata(
             score_type=ScoreType.RAW,
-            raw_value=raw_score,
-            model_name="placeholder",
+            raw_value=round(raw_score, 2),
+            model_name="scraper_evaluate_llm",
             model_version="1.0.0",
             source=SourceType.LINKEDIN,
-            component_scores={"skills_match": raw_score},
-            reasoning=f"Matched {len(matched_skills)} skills"
+            component_scores=component_scores,
+            reasoning=scraper_reason or f"Scraper LLM score: {scraper_score}/10",
+            confidence=min(scraper_score / 10.0, 1.0),
         )
-        
+
         candidate.scores.append(score_metadata)
-    
-    # Normalize scores
+
+    # Normalize scores across the batch
     ranker = DefaultRankingStrategy()
     result.candidates = ranker.normalize_scores(result.candidates, SourceType.LINKEDIN)
-    
+
     result.total_scored = len(result.candidates)
     result.score_time_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-    
+
     metrics = StageMetrics(
         stage=PipelineStage.SOURCE_SCORING,
         started_at=start_time,
@@ -302,13 +409,10 @@ def linkedin_scoring_node(state: CandidateSourcingState) -> dict:
         duration_ms=(datetime.now(timezone.utc) - start_time).total_seconds() * 1000,
         items_in=len(result.candidates),
         items_out=len(result.candidates),
-        custom={"source": "linkedin"}
+        custom={"source": "linkedin", "scoring_method": "scraper_agent_llm"},
     )
-    
-    return {
-        "linkedin_result": result,
-        "stage_metrics": [metrics]
-    }
+
+    return {"linkedin_result": result, "stage_metrics": [metrics]}
 
 
 def github_scoring_node(state: CandidateSourcingState) -> dict:
